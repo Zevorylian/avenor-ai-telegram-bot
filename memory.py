@@ -53,7 +53,8 @@ _LOCK = threading.RLock()
 # The store carries an explicit schema version so a future shape change is a migration
 # step rather than a code change. v0 = every file written before this field existed.
 SCHEMA_VERSION = 1
-_DATA = {"users": {}, "chats": {}, "reminders": {}, "seq": 0, "version": SCHEMA_VERSION}
+_DATA = {"users": {}, "chats": {}, "reminders": {}, "signals": {}, "seq": 0,
+         "version": SCHEMA_VERSION}
 _LOADED = False
 
 # AI names we quietly count when a user talks about them.
@@ -104,6 +105,9 @@ def _load_unlocked() -> None:
             _DATA["users"] = raw.get("users", {}) or {}
             _DATA["chats"] = raw.get("chats", {}) or {}
             _DATA["reminders"] = raw.get("reminders", {}) or {}
+            # Counters only, never text. Without this line a restart silently wiped the
+            # self-improvement signals, which is the same bug the loader had for chats.
+            _DATA["signals"] = raw.get("signals", {}) or {}
             _DATA["seq"] = int(raw.get("seq", 0) or 0)
             _DATA["version"] = int(raw.get("version", 0) or 0)
             if _migrate():
@@ -565,6 +569,58 @@ def set_chat_flag(chat_id, key: str, value) -> None:
         _touch(c)
         c[key] = value
     save()
+
+
+def set_user_flag(user_id, key: str, value) -> bool:
+    """A per-person setting that survives a restart (data-use consent lives here).
+
+    Returns False when that person is not in the store yet - the caller records them
+    first, so a flag is never invented for a user we have never seen.
+    """
+    if user_id is None or not key:
+        return False
+    load()
+    with _LOCK:
+        u = _DATA["users"].get(str(user_id))
+        if u is None:
+            return False
+        _touch(u)
+        u.setdefault("flags", {})[key] = value
+    save()
+    return True
+
+
+def get_user_flag(user_id, key: str, default=None):
+    """Read one per-person setting. Never raises; missing means `default`."""
+    if user_id is None or not key:
+        return default
+    load()
+    with _LOCK:
+        u = _DATA["users"].get(str(user_id)) or {}
+        return (u.get("flags") or {}).get(key, default)
+
+
+def bump_signal(key: str, delta: int = 1) -> None:
+    """A COUNTER only - never message text, never a name, never an ID.
+
+    This is what the self-improvement loop is allowed to read. Free text was the mistake
+    the earlier audit found: redacted messages are still personal data.
+    """
+    if not key:
+        return
+    load()
+    with _LOCK:
+        s = _DATA.setdefault("signals", {})
+        s[str(key)[:40]] = int(s.get(str(key)[:40], 0)) + int(delta)
+    save()
+
+
+def get_signals() -> dict:
+    """A copy of the counters, biggest first. Safe to print to the owner."""
+    load()
+    with _LOCK:
+        s = dict(_DATA.get("signals") or {})
+    return dict(sorted(s.items(), key=lambda kv: -int(kv[1] or 0)))
 
 
 def get_chat(chat_id) -> dict:

@@ -1,6 +1,6 @@
 # Privacy Policy — Avenor (Telegram bot @AvenorOrbitBot)
 
-*Last updated: 1 November 2026*
+*Last updated: 23 November 2026*
 
 This policy explains, in plain language, what Avenor ("the bot", "we", "us") does with
 information when you message it. It is written to match what the bot actually does — nothing
@@ -31,6 +31,7 @@ user ID)**:
 - **Notes and a short profile** the bot keeps so it can remember you — these come from things
   you tell it, and you can see and delete them at any time
 - **Reminders** you ask for (the text and the time they are due)
+- **Two data switches** (section 4a) — whether your use may help improve the bot
 
 Kept only in memory (RAM) while the bot is running, and **not** written to storage:
 
@@ -58,13 +59,48 @@ section 5), but nothing about it is written to storage.
 - To prevent abuse and keep the service working
 - To keep basic, non-identifying usage counts (for example, how many users the bot has)
 
-We do not sell your data, and we do not use your conversations to train AI models.
+We do not sell your data, and **we do not train any AI model on your messages.** What can be
+recorded to improve the bot is a set of counters about the bot's own mistakes — see section 4a.
+That is on by default and you can switch it off.
 
 When the bot gets something wrong it records a short, **de-identified** note about the
 failure - for example "the model denied having web access" - so the same mistake can be fixed.
 Before anything is stored, Telegram IDs, @usernames, email addresses and phone numbers are
 replaced with `[id]`, and the chat or user it came from is not recorded at all. These notes
 describe the bot's own behaviour, never a person, and they are never used to train a model.
+
+## 4a. Data switches — "help improve the AI" (default ON)
+
+This works like the "Improve the model for everyone" setting in ChatGPT: it is **on by default**,
+and it is yours to switch off.
+
+**What is recorded when the switch is on:** counters only.
+
+- `humour_reject` — a reply to a joke was rejected for lecturing or inventing a quote
+- `promise_guard` — a reply was only a promise ("I'll check and tell you") and had to be replaced
+- `search_miss` — a live lookup came back empty
+- `feedback_up` / `feedback_down` — you reacted 👍 or 👎 to one of the bot's own messages
+
+Each counter is a number. **No message text, no name, no ID and no chat is stored with it.**
+The bot's self-improvement command (`/improve`, owner-only) reads only these totals.
+
+**The second switch** covers your voice notes: whether they may be used the same way. Off by
+default it is not — both switches start ON, and both can be turned off.
+
+**How to switch off**
+
+- `/privacy` → tap the switch (🟢 → 🔴)
+- or just write it: *"mera data use mat karo"*, *"don't use my data"*, *"improve off"*
+- to switch voice separately: *"voice data band karo"*
+
+**What switching off does and does not do**
+
+- It stops all recording for you from that moment.
+- It does **not** delete what is already stored — `/forget` does that.
+- It does not stop the bot working; it only stops the counters.
+
+**Feedback.** A 👍 or 👎 reaction on the bot's reply is counted only when the improvement
+switch is on, and only as a number. Reactions on other people's messages are ignored.
 
 ## 5. Who else sees it (sub-processors)
 
@@ -110,6 +146,8 @@ States, where these providers operate).
 - **Reminders** — until they fire, or you delete them, or the retention sweep removes them
   (a user removed by the sweep has their pending reminders removed with them).
 - **Recent chat transcript** — only in memory, and dropped once the chat is idle.
+- **Quality counters** (section 4a) — kept as running totals with no link to any message,
+  until the store is reset; they cannot be traced back to you.
 - **Server logs** — kept by the hosting provider for a short period for debugging.
 
 On free hosting the storage is **ephemeral**: memory can be lost when the service restarts or
@@ -117,6 +155,7 @@ redeploys.
 
 ## 8. Your controls
 
+- `/privacy` — see and change the two data switches (section 4a)
 - `/memory` — see what the bot has stored about you
 - `/forget` — delete everything the bot stored about you
 - `/reminders` and `/delremind` — manage your reminders
@@ -139,7 +178,8 @@ please do not send anything you would not want processed by an AI provider.
 
 We may update this policy. The "last updated" date above will change, and continued use after
 a change means you accept the new version. The current version always lives in the project
-repository (`privacy-policy.md`) and is available in the bot with `/privacy`.
+repository (`privacy-policy.md`). The bot shows the switches in `/privacy` and the text of this
+policy in the same place, so the setting is never buried in a document nobody opens.
 
 ## 12. Contact
 

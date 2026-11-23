@@ -102,7 +102,7 @@ from telegram.error import (BadRequest, Conflict, InvalidToken, NetworkError,
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters,
+    CallbackQueryHandler, ChatMemberHandler, MessageReactionHandler, ContextTypes, filters,
 )
 from google import genai
 from google.genai import types
@@ -2151,6 +2151,122 @@ def _humour_mode(text: str) -> bool:
     """
     names = pick_packs(text or "")
     return "humour" in names and "file" not in names
+
+
+# --- data-use consent ---------------------------------------------------------------
+# Default ON, the way ChatGPT's "Improve the model for everyone" is on by default: the bot
+# learns from use and the person can switch it off. What it learns is COUNTERS - never a
+# message, a name or an ID. Free text in the learning pipeline was the mistake the earlier
+# audit found: "redacted" messages are still personal data.
+CONSENT_KEYS = ("improve", "voice")
+CONSENT_DEFAULT = {"improve": True, "voice": True}
+_CONSENT_TITLE = {
+    "improve": "Improve the AI from my chats",
+    "voice": "Use my voice notes to improve it",
+}
+_CONSENT_OFF_RE = re.compile(
+    r"\b(?:mera|meri|my|apna)\s+(?:data|chats?|baat\w*)\b[\s\S]{0,30}?"
+    r"\b(?:use|share|save|train|seekh)\w*\b[\s\S]{0,20}?\b(?:mat|na|nahi|nhi|band|off|stop)\b"
+    r"|\b(?:improve|training|model)\b[\s\S]{0,20}?\b(?:band|off|mat|stop|disable)\b"
+    r"|\b(?:voice|awaaz|audio)\s*(?:data|notes?|recording\w*)\b[\s\S]{0,12}?"
+    r"\b(?:band|off|mat|stop|disable)\b"
+    r"|\bopt\s*out\b|\bdo\s+not\s+train\b", re.I)
+_CONSENT_ON_RE = re.compile(
+    r"\b(?:mera|meri|my|apna)\s+(?:data|chats?|baat\w*)\b[\s\S]{0,30}?"
+    r"\b(?:use|share|save|train|seekh)\w*\b[\s\S]{0,20}?\b(?:karo|kar\s*do|kar|on|allow|haan)\b"
+    r"|\b(?:improve|training|model)\b[\s\S]{0,15}?\b(?:on|chalu|enable)\b"
+    r"|\bopt\s*in\b", re.I)
+_CONSENT_VOICE_RE = re.compile(r"\b(?:voice|awaaz|audio|mic)\b", re.I)
+# Which messages are MINE. Feedback arrives as a reaction on one of these, and a reaction
+# on someone else's message is not feedback about me.
+_BOT_MSGS = defaultdict(lambda: deque(maxlen=80))
+_REMIND_WANT_RE = re.compile(
+    r"\b(?:yaad\s+dila\w*|yaad\s+rakh\w*|remind\s+me|reminder|alert\s+me|"
+    r"reminder\s+lagao)\b", re.I)
+
+
+def consent_on(uid, key: str = "improve") -> bool:
+    """Is this person's data allowed to improve the bot? Default: yes."""
+    if MEM is None:
+        return bool(CONSENT_DEFAULT.get(key, True))
+    val = MEM.get_user_flag(uid, "consent_" + key, None)
+    return bool(CONSENT_DEFAULT.get(key, True)) if val is None else bool(val)
+
+
+def consent_set(uid, key: str, value) -> bool:
+    """Store one switch. False when memory is off or the key is unknown."""
+    if MEM is None or key not in CONSENT_KEYS:
+        return False
+    return MEM.set_user_flag(uid, "consent_" + key, bool(value))
+
+
+def _signal(uid, key: str) -> None:
+    """Count one quality event - only when this person has left improvement ON.
+
+    No text, no name, no ID: a counter is the only thing the self-improvement loop reads.
+    """
+    try:
+        if MEM is not None and consent_on(uid, "improve"):
+            MEM.bump_signal(key)
+    except Exception as e:  # noqa: BLE001
+        log.debug("signal %s failed: %s", key, str(e)[:80])
+
+
+def _privacy_text(uid) -> str:
+    """The privacy page: what is stored, and the two switches, in the person's words."""
+    def mark(key):
+        return "ON" if consent_on(uid, key) else "OFF"
+    return (
+        "🔐 Privacy & data\n\n"
+        "*What I store:* your Telegram ID, first name, username, language, message counts, "
+        "the notes you ask me to remember, your reminders, and these two switches.\n"
+        "Messages go to the model provider to make a reply. Files, photos and voice notes "
+        "are processed for that reply, not kept.\n\n"
+        "*Data switches (default: ON)*\n"
+        f"• {_CONSENT_TITLE['improve']}: *{mark('improve')}*\n"
+        f"• {_CONSENT_TITLE['voice']}: *{mark('voice')}*\n\n"
+        "With a switch ON I keep *counts* of what went wrong - a joke reply that had to be "
+        "rejected, a promise I had to replace, a file that failed its syntax check. Never "
+        "your messages, never a name. That is what /improve reads.\n"
+        "Switch it OFF and nothing is counted for you. Turning it off does not delete what "
+        "is already stored.\n\n"
+        "/memory shows what I hold. /forget deletes all of it. Plain words work too: "
+        "\"mera data use mat karo\".")
+
+
+def _privacy_kb(uid):
+    def lbl(key):
+        return ("🟢 " if consent_on(uid, key) else "🔴 ") + _CONSENT_TITLE[key]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(lbl("improve"), callback_data="pv_improve")],
+        [InlineKeyboardButton(lbl("voice"), callback_data="pv_voice")],
+        [InlineKeyboardButton("📄 Full policy", callback_data="pv_doc"),
+         InlineKeyboardButton("✖️ Close", callback_data="pv_close")],
+    ])
+
+
+async def _privacy_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    q = u.callback_query
+    data = q.data or ""
+    uid = q.from_user.id
+    if data == "pv_close":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if data == "pv_doc":
+        await cmd_privacy(u, c)
+        return
+    key = data.split("_", 1)[1]
+    if key in CONSENT_KEYS:
+        consent_set(uid, key, not consent_on(uid, key))
+        log.info("consent %s -> %s for %s", key, consent_on(uid, key), uid)
+        try:
+            await q.edit_message_text(md_to_html(_privacy_text(uid)),
+                                      parse_mode="HTML", reply_markup=_privacy_kb(uid))
+        except Exception as e:  # noqa: BLE001
+            log.debug("privacy page edit failed: %s", str(e)[:80])
 
 
 # --- humour verifier ---------------------------------------------------------------
@@ -4685,71 +4801,43 @@ def _about_text() -> str:
     return ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak Danodia.\n"
             f"Source: https://github.com/bydenvik/avenor-ai-telegram-bot (MIT)\n"
             f"Bot: @{_handle()} - menu buttons *+* AI answers, both. Running 24/7.")
-HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
-        "/about - about the bot\n/skills - what I can do, with examples\n"
-        "/info - your name, ID, chat, members, date\n"
-        "/members - list the members I have seen\n/rules - group rules\n"
-        "/setup - post + pin the rules message with a confirm button\n"
-        "/stats - group information\n/voice on|off - voice replies\n"
-        "/voicemessage <q> - reply by voice\n/setvoice <name> - change the voice\n"
-        "/ai <question> - ask the AI\n/image <description> - create an image\n"
-        "/memory - what I remember (owner sees all)\n"
-        "/proactive on|off - let me send useful ideas on my own\n"
-        "/voicepreview <name> - hear a voice before setting it\n"
-        "/voicecreate <desc|anime> - design a custom voice (owner)\n"
-        "/voicefind <word> - search 2000+ voices\n"
-        "/myphoto - describe my profile picture\n/logo - describe your logo\n"
-        "/id - your Telegram ID\n/clear - clear chat memory\n"
+HELP = ("❓ *Help*\n\n"
+        "You do not need commands. Just type:\n"
+        "• a question - answered with a live web lookup when it matters\n"
+        "• 'kal 5 baje yaad dilana' - a reminder, set without any command\n"
+        "• '3 file banao: html, css, js' - real files\n"
+        "• 'ek image banao ...' - an image\n"
+        "• 'kya yaad hai mujhe' - what I remember about you\n"
+        "• a photo, a voice note, a PDF or a link - I read it\n\n"
+        "*The few commands worth knowing*\n"
+        "/menu - buttons for everything\n"
+        "/privacy - what I store, and the data switches\n"
+        "/memory - what I remember about you\n"
+        "/reminders - your reminders\n"
         "/forget - delete everything I stored about you\n"
-        "/remind 30m <kaam> - set a reminder (also: 'remind me in 2h to call mom')\n"
-        "/reminders - list your reminders\n/delremind <id> - delete one\n"
-        "/privacy - how your data is handled\n/feed <rss-url> - read an RSS/Atom feed\n"
-        "/papers <topic> - search arXiv papers\n/define <word> - dictionary meaning\n"
-        "/holiday [IN] - public holidays\n"
-        "/research <query> - look something up on the live web\n\n"
-        "💡 Send text, a photo, a voice note, a PDF or a YouTube link - the AI replies in "
-        "your language.")
+        "/id - your Telegram ID\n"
+        "/help - this message\n\n"
+        "Everything else (voice, image, research, feed, papers, define, holiday, rules, "
+        "stats) is behind /menu or plain words - the long command list was a maze, so it "
+        "is gone.")
+# TEN commands, not thirty-five.
+#
+# Telegram's own guidelines say bots "overuse this input method" and that a command list
+# stops being a menu and becomes a wall of text; a bot that rebuilt its surface from 50
+# commands to one /menu reported that support questions changed from "where is the
+# setting" to real questions. Every handler below still works if someone types it - the
+# published list is the supported path, /menu is the discoverable one.
 PUBLIC_COMMANDS = [
-    # --- getting started ---
     ("start", "Start the bot"),
-    ("help", "Show every command"),
-    ("skills", "What I can do (with examples)"),
-    ("about", "About Avenor"),
-    ("id", "Your Telegram ID"),
-    ("info", "Your info and this chat"),
-    # --- talk to the AI ---
-    ("ai", "Ask the AI"),
-    ("research", "Look something up on the live web"),
-    ("image", "Create an image"),
-    # --- voice ---
-    ("voice", "Turn voice replies on or off"),
-    ("voicemessage", "Ask something and get a voice reply"),
-    ("setvoice", "Change my voice"),
-    ("voicepreview", "Hear a voice before setting it"),
-    # --- reminders ---
-    ("remind", "Set a reminder: /remind 30m drink water"),
-    ("reminders", "List your reminders"),
-    ("delremind", "Delete a reminder by its id"),
-    # --- lookup tools ---
-    ("feed", "Read an RSS/Atom feed: /feed <url>"),
-    ("papers", "Search arXiv papers"),
-    ("define", "Dictionary: /define <word>"),
-    ("holiday", "Public holidays: /holiday [country]"),
-    ("myphoto", "Describe my profile picture"),
-    ("logo", "Describe your logo"),
-    # --- memory & privacy ---
+    ("menu", "Everything, as buttons"),
+    ("help", "How to use me (no commands needed)"),
+    ("privacy", "What I store + your data switches"),
     ("memory", "What I remember about you"),
-    ("proactive", "Let me send useful ideas on my own"),
-    ("privacy", "How your data is handled"),
-    ("clear", "Clear this chat's memory"),
+    ("reminders", "Your reminders"),
     ("forget", "Delete everything I stored about you"),
-    # --- groups ---
-    ("rules", "Show the group rules"),
-    ("setup", "Post and pin the rules (admin)"),
-    ("welcome", "Re-post the welcome card (admin)"),
-    ("stats", "Group information"),
-    ("safety", "Spam + malicious-file rules and recent blocks"),
-    ("members", "Members I have seen"),
+    ("voice", "Voice replies on / off"),
+    ("id", "Your Telegram ID"),
+    ("skills", "What I can do, with examples"),
 ]
 OWNER_COMMANDS = [
     ("improve", "Propose a change to my own code (owner)"),
@@ -4773,6 +4861,15 @@ CONTACT = "📞 *Contact*\n\nAny question or problem? Just send your message her
 
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await u.message.reply_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu())
+
+
+async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """The one entry point: everything is a button here, so nothing has to be remembered.
+
+    Published as /menu because the ten-command list has to be honest - a command in the
+    menu that no handler answers is worse than no command at all.
+    """
     await u.message.reply_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu())
 
 
@@ -5410,8 +5507,10 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
     await rate_gate(chat_id)
     for _ in range(2):
         try:
-            await u.message.reply_text(html, parse_mode="HTML",
-                                       reply_parameters=reply_parameters)
+            _sent = await u.message.reply_text(html, parse_mode="HTML",
+                                               reply_parameters=reply_parameters)
+            if _sent is not None:
+                _BOT_MSGS[chat_id].append(_sent.message_id)
             return
         except RetryAfter as e:
             log.info("RetryAfter %ss on reply", e.retry_after)
@@ -5426,6 +5525,28 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
     except Exception as e:  # noqa: BLE001
         log.warning("Plain reply failed (%s), sending without reply link", e)
     await _send_plain(c.bot, chat_id, md_to_plain(plain))
+
+
+async def on_reaction(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Thumbs up / down on MY reply is the only feedback signal worth having.
+
+    No text is stored and nothing is recorded for a person who turned improvement off.
+    """
+    r = getattr(u, "message_reaction", None)
+    if r is None or getattr(r, "user", None) is None or r.user.is_bot:
+        return
+    if MEM is None or not consent_on(r.user.id, "improve"):
+        return
+    try:
+        if r.message_id not in _BOT_MSGS.get(r.chat.id, ()):
+            return
+        ups = {getattr(x, "emoji", "") for x in (r.new_reaction or [])}
+        key = "feedback_up" if "👍" in ups else ("feedback_down" if "👎" in ups else "")
+        if key:
+            await asyncio.to_thread(MEM.bump_signal, key)
+            log.info("reaction feedback %s from %s", key, r.user.id)
+    except Exception as e:  # noqa: BLE001
+        log.debug("reaction feedback failed: %s", str(e)[:80])
 
 
 async def _kick_typing(bot, chat_id) -> None:
@@ -5654,6 +5775,45 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         _g = ("Memory personal hoti hai - mujhe DM karke puchho, wahan bata dunga.")
         await _safe_send(u, c, md_to_html(_g), _g)
         return
+
+    # A data switch is a consent decision, not a question for the model: it is applied here,
+    # immediately, and confirmed in one line.
+    if text and MEM is not None and (_CONSENT_OFF_RE.search(text) or _CONSENT_ON_RE.search(text)):
+        _ck = "voice" if _CONSENT_VOICE_RE.search(text) else "improve"
+        _cv = bool(_CONSENT_ON_RE.search(text)) and not _CONSENT_OFF_RE.search(text)
+        if consent_set(u.effective_user.id, _ck, _cv):
+            _cl = _msg(_lang_for(u),
+                       en=("Done - " + _CONSENT_TITLE[_ck] + ": " + ("ON" if _cv else "OFF") +
+                           ". " + ("I will count what goes wrong so /improve can use it."
+                                   if _cv else "Nothing is counted for you from now on.") +
+                           " /privacy shows both switches."),
+                       hi=("हो गया - " + _CONSENT_TITLE[_ck] + ": " + ("चालू" if _cv else "बंद") +
+                           ". /privacy पर दोनों स्विच देख सकते हैं।"),
+                       hinglish=("Ho gaya - " + _CONSENT_TITLE[_ck] + ": " +
+                                 ("ON" if _cv else "OFF") + ". " +
+                                 ("Ab main galtiyon ke counts rakhunga, /improve usi se seekhta hai."
+                                  if _cv else "Ab tumhara kuch count nahi hoga.") +
+                                 " /privacy me dono switch hain."))
+            await _safe_send(u, c, md_to_html(_cl), _cl)
+            return
+
+    # One-time, honest notice. The setting is ON by default, so the person is told on the
+    # first message - not buried in a document nobody opens.
+    if MEM is not None and text:
+        _uid0 = u.effective_user.id
+        if not MEM.get_user_flag(_uid0, "seen_notice", 0):
+            if MEM.set_user_flag(_uid0, "seen_notice", 1):
+                _nl = _msg(_lang_for(u),
+                           en=("Heads-up: I keep anonymous counts of my own mistakes so I can "
+                               "improve (default ON). Your messages are not stored for this. "
+                               "Turn it off any time: /privacy, or just say \"don't use my data\"."),
+                           hi=("सूचना: अपनी गलतियाँ सुधारने के लिए मैं गिनती रखता हूँ (डिफ़ॉल्ट चालू)। "
+                               "इसके लिए आपके संदेश नहीं रखे जाते। बंद करने के लिए /privacy।"),
+                           hinglish=("Sun lo ek baat: apni galtiyan sudharne ke liye main sirf "
+                                     "ginti rakhta hoon (default ON) - tumhare messages iske liye "
+                                     "save nahi hote. Band karna ho: /privacy, ya bas likho "
+                                     "\"mera data use mat karo\"."))
+                await _send_plain(c.bot, chat_id, _nl)
 
     is_private = u.effective_chat.type == "private"
     # Humour is decided ONCE, in code, and then enforced below - not hoped for in a prompt.
@@ -5911,6 +6071,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 results = _untrusted(await free_web_search(q, RESEARCH_RESULTS))
                 if not results:
                     log.info("research for %r returned nothing", q[:60])
+                    _signal(u.effective_user.id, "search_miss")
                     break
                 ctx2 = (ctx + f"\n\n=== LIVE RESULTS for '{q}' (fetched just now) ===\n"
                         + results +
@@ -6005,12 +6166,16 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # ---- HUMOUR VERIFIER -------------------------------------------------
             # Code has the last word on a joke turn (see _humour_reply_ok).
             if _humour and ans and "[file:" not in (ans or "").lower():
+                _before = ans
                 ans = await _humour_fix(chat_id, text, ans, lang, image, audio, doc)
+                if ans != _before:
+                    _signal(u.effective_user.id, "humour_reject")
 
             # ---- PROMISE GUARD ---------------------------------------------------
             # Runs for every turn, not only jokes: a promise-only reply is never useful.
             if ans and _PROMISE_ONLY_RE.match((ans or "").strip()):
                 ans = await _no_promise_fix(chat_id, text, lang, image, audio, doc)
+                _signal(u.effective_user.id, "promise_guard")
 
             # ---- AUTONOMOUS FILE / VOICE / IMAGE --------------------------------
             # A reply may carry up to MAX_FILES_PER_REPLY blocks: a website is usually
@@ -6164,6 +6329,23 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             log.info("reminder set for %s (silent tool)", u.effective_user.id)
                     except Exception as e:  # noqa: BLE001
                         log.debug("remind failed: %s", e)
+            elif (text and MEM is not None and _REMIND_WANT_RE.search(text)):
+                # The model forgot the tag. A reminder the person asked for must not vanish
+                # because a free-tier model skipped one line - so it is set here.
+                _due, _what = parse_reminder(text)
+                if _due and _what and len(_what.strip()) > 2:
+                    try:
+                        if await asyncio.to_thread(MEM.add_reminder,
+                                                   u.effective_user.id, chat_id, _what, _due):
+                            log.info("reminder set by the safety net for %s",
+                                     u.effective_user.id)
+                            _rline = _msg(lang,
+                                          en="Reminder set.",
+                                          hi="रिमाइंडर सेट हो गया।",
+                                          hinglish="Reminder set kar diya.")
+                            ans = ((ans or "").strip() + "\n\n" + _rline).strip()
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("remind safety net failed: %s", str(e)[:80])
             if not reacted:
                 emoji = find_reaction(ans)
                 if emoji:
@@ -6343,6 +6525,8 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     d = q.data
     if (d or "").startswith("imp_"):
         return await _improve_button(u, c)
+    if (d or "").startswith("pv_"):
+        return await _privacy_button(u, c)
     if d == "capture":
         remember_member(q.message.chat_id, q.from_user)
         try:
@@ -9944,7 +10128,20 @@ async def cmd_feed(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_privacy(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the privacy policy. Read from the repo file so it is always the current version."""
+    """The privacy page: the two data switches first, the full policy on request.
+
+    A policy nobody reads is not consent. The switches are the point, so they are the
+    first thing on the page and they are buttons.
+    """
+    if getattr(u.effective_chat, "type", "private") == "private" and MEM is not None:
+        _txt = _privacy_text(u.effective_user.id)
+        await _safe_send(u, c, md_to_html(_txt), _txt)
+        try:
+            await c.bot.send_message(u.effective_chat.id, "Tap to change:",
+                                     reply_markup=_privacy_kb(u.effective_user.id))
+        except Exception as e:  # noqa: BLE001
+            log.debug("privacy keyboard failed: %s", str(e)[:80])
+        return
     text = ""
     try:
         with open(PRIVACY_FILE, "r", encoding="utf-8") as f:
@@ -11303,6 +11500,12 @@ async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if SELF_IMPROVE and cred != "none":
         lines += ["", "Ready. Try `/improve BUSY_MSG` (a name works better than a sentence)."]
 
+    if MEM is not None:
+        _sig = MEM.get_signals()
+        if _sig:
+            _top = list(_sig.items())[:6]
+            lines += ["", "*Quality counters* (no text, consent-gated): "
+                      + ", ".join(f"{k}={v}" for k, v in _top)]
     lines += ["", "*Lessons recorded:*", _lesson_stats()]
     if _PROPOSALS:
         lines += ["", "*Waiting for you:*"] + [f"• {k} — {v['why'][:60]}"
@@ -11348,6 +11551,7 @@ def _build_app() -> Application:
         log.warning("AIORateLimiter unavailable (%s) -> custom rate gate", str(e)[:80])
     app: Application = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(CommandHandler("about", cmd_about))
@@ -11387,6 +11591,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
+    # Thumbs up/down on a reply is feedback; no extra UI, no extra command.
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(ChatMemberHandler(on_chat_member,
                                       chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(
