@@ -37,7 +37,7 @@ Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chai
   GEMINI_API_KEY     (required)  Google AI Studio free key
   GEMINI_MODELS      (optional)  ordered by free daily quota; built-in default:
                                  gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3-flash-preview,
-                                 gemma-4-31b-it, gemini-3.6-flash, gemini-3.8-flash
+                                 gemma-4-31b-it, gemini-3.6-flash
   GROQ_API_KEY       (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
   GROQ_MODELS        (optional)  default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b
   TTS_MODELS         (optional)  default: gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts
@@ -150,15 +150,17 @@ MODEL_RPD = {
     "gemini-3.5-flash-lite": "~500", "gemini-3.1-flash-lite": "~500",
     "gemma-4-31b-it": "large", "gemma-4-26b-a4b-it": "large",
     "gemini-3-flash-preview": "free", "gemini-3.6-flash": "~20",
-    "gemini-3.8-flash": "~20",
 }
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
     "gemini-3.5-flash-lite",   # ~500 RPD - the workhorse, most available
     "gemini-3.1-flash-lite",   # ~500 RPD
     "gemini-3-flash-preview",  # free tier, proved OK on the live self-test
     "gemma-4-31b-it",          # free-only tier, huge allowance (weaker, so lower down)
-    "gemini-3.6-flash",        # ~20 RPD - scarce
-    "gemini-3.8-flash",        # ~20 RPD - best quality, last resort
+    "gemini-3.6-flash",        # ~20 RPD - scarce, last resort only
+    # gemini-3.8-flash is deliberately NOT here: ~20 requests/day, so it answered a handful
+    # of messages and then sat out the rest of the day while the chain paid the latency of
+    # trying it. Quality you cannot reach is worth nothing; five reachable models beat six
+    # with one dead.
 ]
 
 _tts_env = os.environ.get("TTS_MODELS", "").strip()
@@ -4862,6 +4864,14 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
                             effort: str = ""):
     if client is None or not ENABLE_STREAM:
         return None
+    # Same budget gate as ask_gemini(). Streaming used to start a model call without
+    # checking or spending the per-turn budget, so the cheapest path was also the one
+    # that could run unbounded. Returning None here makes the caller fall back to
+    # ask_gemini(), which refuses on its own.
+    if not _turn_allows(chat_id):
+        log.info("turn budget used up for chat %s - skipping the streaming call", chat_id)
+        return None
+    _turn_spend(chat_id)
     effort = effort or _EFFORT_BY_CHAT.get(chat_id, "")
     _level = EFFORT_THINKING.get(effort, "") or THINKING_LEVEL
     _tokens = EFFORT_TOKENS.get(effort, MAX_OUTPUT_TOKENS)
@@ -5516,7 +5526,13 @@ async def cmd_clear(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                 await _send_plain(c.bot, chat.id, "That command is for group admins.")
                 return
         except Exception as e:  # noqa: BLE001
-            log.debug("clear admin check failed: %s", e)
+            # Fail CLOSED. A permission lookup that errors used to fall through and wipe
+            # the shared transcript anyway - a destructive action must deny by default.
+            log.warning("clear admin check errored (%s) - denying the command", str(e)[:80])
+            await _send_plain(c.bot, chat.id,
+                              "I could not verify that you are an admin, so I did not "
+                              "clear anything.")
+            return
     CHAT_LOG.pop(chat.id, None)
     log.info("chat transcript cleared in %s by %s", chat.id,
              getattr(u.effective_user, "id", "?"))
@@ -7964,6 +7980,27 @@ def _mojeek_lines(html: str, n: int) -> list:
     return out
 
 
+def _yt_caption_host_ok(url: str) -> bool:
+    """Is this a YouTube caption URL we are willing to fetch? Pure."""
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    if not host:
+        return False
+    return (host in ("youtube.com", "www.youtube.com", "googlevideo.com")
+            or host.endswith(".youtube.com") or host.endswith(".googlevideo.com"))
+
+
+def _mojeek_urls(page: str, n: int = 5) -> list:
+    """The result URLs Mojeek gave, so the deep reader can open them. Pure."""
+    urls = []
+    for m in re.finditer(r'<a[^>]+class="title"[^>]+href="([^"]+)"', page or "", re.I):
+        u = html.unescape(m.group(1)).replace("&amp;", "&")
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+        if len(urls) >= n:
+            break
+    return urls
+
+
 async def _wikipedia(query: str, n: int = 3) -> list:
     """Wikipedia's public API - keyless and reliable, but needs the descriptive UA above."""
     r = await HTTP.get("https://en.wikipedia.org/w/api.php",
@@ -8782,13 +8819,19 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
                 tracks = []
             base = _yt_unescape((tracks[0] or {}).get("baseUrl") or "") if tracks else ""
             if base:
-                try:
-                    r = await HTTP.get(base, headers=_YH_HEADERS, timeout=10)
-                    if r.status_code == 200:
-                        txt = html.unescape(re.sub(r"<[^>]+>", " ", r.text or ""))
+                # The caption URL is a direct HTTP.get, which bypasses the SSRF guard every
+                # other outbound fetch goes through. It is checked here: same host family,
+                # same public-IP rule, same size cap.
+                if not _yt_caption_host_ok(base):
+                    log.info("yt captions: refusing a non-YouTube caption host %s",
+                             (urllib.parse.urlparse(base).hostname or "")[:40])
+                else:
+                    _got = await _fetch(base, headers=_YH_HEADERS, timeout=10, attempts=1,
+                                        deadline=12)
+                    if _got is not None and _got.status_code == 200:
+                        _raw = (_got.content or b"").decode("utf-8", "ignore")
+                        txt = html.unescape(re.sub(r"<[^>]+>", " ", _raw))
                         transcript = re.sub(r"\s+", " ", txt).strip()[:3000]
-                except Exception as e:  # noqa: BLE001
-                    log.debug("yt captions failed: %s", str(e)[:80])
     if not (title or desc or transcript):
         return ""
     if not thumb:
@@ -9457,6 +9500,11 @@ async def _web_lookup(query: str, n: int, deep: bool, use_wiki: bool = True) -> 
     lines = _ddg_lite_lines(html, n) if html else []
     if lines:
         log.info("research via ddg lite -> %s results", len(lines))
+    _deep_urls: list = []
+    if lines:
+        # DDG wraps every result in a /l/?uddg= redirect; the real URL has to be unwrapped.
+        _deep_urls = [urllib.parse.unquote(u) for u in
+                      re.findall(r"uddg=([^&\"'\s]+)", html or "")][:RESEARCH_PAGES]
     if not lines:
         # DDG is a scraper of somebody else's engine and answers bots with a CAPTCHA page;
         # Mojeek runs its own index, so it is asked before falling back to encyclopedias.
@@ -9465,7 +9513,10 @@ async def _web_lookup(query: str, n: int, deep: bool, use_wiki: bool = True) -> 
         if _mlines:
             lines = _mlines
             log.info("research via mojeek -> %s results", len(_mlines))
-            html = _mj
+            # Mojeek links are DIRECT, so the deep reader gets them from here. Before this,
+            # a Mojeek fallback produced snippets only: the reader looked for DDG's uddg=
+            # and found nothing, so no page was ever opened.
+            _deep_urls = _mojeek_urls(_mj, n)
     if not lines and use_wiki:
         for fn in (_wikipedia, _ddg_instant):
             try:
@@ -9479,11 +9530,9 @@ async def _web_lookup(query: str, n: int, deep: bool, use_wiki: bool = True) -> 
     if not lines:
         return ""
     body = "=== WEB RESULTS (just now) ===\n" + "\n".join(lines)
-    if deep and RESEARCH_DEEP and html:
+    if deep and RESEARCH_DEEP and _deep_urls:
         try:
-            raw = re.findall(r"uddg=([^&\"'\s]+)", html)
-            urls = [urllib.parse.unquote(u) for u in raw]
-            urls = [u for u in urls
+            urls = [u for u in _deep_urls
                     if u.startswith("http") and "duckduckgo.com" not in u][:RESEARCH_PAGES]
             for u in urls:
                 txt = await _read_page(u, RESEARCH_PAGE_CHARS)
