@@ -94,8 +94,9 @@ from zoneinfo import ZoneInfo
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                       ReactionTypeEmoji, ReplyParameters, BotCommand,
-                      BotCommandScopeChat, ChatPermissions,
-                      InputMediaDocument)
+                      BotCommandScopeChat, BotCommandScopeAllPrivateChats,
+                      BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators,
+                      ChatPermissions, InputMediaDocument)
 from telegram.constants import ChatAction
 from telegram.error import (BadRequest, Conflict, InvalidToken, NetworkError,
                             RetryAfter, TimedOut)
@@ -2198,6 +2199,52 @@ def consent_set(uid, key: str, value) -> bool:
     if MEM is None or key not in CONSENT_KEYS:
         return False
     return MEM.set_user_flag(uid, "consent_" + key, bool(value))
+
+
+# --- automatic feedback --------------------------------------------------------------
+# Almost nobody taps 👍/👎, so waiting for a reaction collects nothing. The honest signal is
+# what the person does NEXT: asks the same thing again (the answer missed), corrects it, or
+# thanks you. That is inferred from their own words, and it is still only a counter.
+_LAST_ASK: dict = {}
+_CORRECTION_RE = re.compile(
+    r"\b(?:galat|wrong|incorrect|aisa\s+nahi|aise\s+nahi|aisi\s+nahi|matlab|"
+    r"i\s+meant|not\s+what|phir\s+se|dobara|samajh\s+nahi|samjha\s+nahi|"
+    r"answer\s+nahi|repeat\s+kar)\b", re.I)
+_THANKS_RE = re.compile(
+    r"\b(?:thanks|thank\s+you|thx|shukriya|dhanyavad|dhanyawad|perfect|"
+    r"sahi\s+hai|sahi\s+bola|badhiya|badiya|mast|acha\s+laga|great|nice|"
+    r"kaam\s+kar\s+gaya|ho\s+gaya)\b", re.I)
+
+
+def _norm_words(t: str) -> set:
+    """Words worth comparing: 3+ letters, any script this bot serves. Pure."""
+    return {w for w in re.findall(r"[a-z\u0900-\u097F]{3,}", (t or "").lower())}
+
+
+def _auto_feedback(uid, chat_id, text: str) -> None:
+    """Infer one quality signal from this message about the PREVIOUS answer.
+
+    No text is stored: the previous question is kept in RAM only, for 15 minutes, to compare
+    word overlap, and it is dropped with the process. Counters are the only thing written.
+    """
+    prev = _LAST_ASK.get((chat_id, uid))
+    if not prev:
+        return
+    old, ts = prev
+    if time.time() - ts > 900:
+        return
+    t = text or ""
+    if _CORRECTION_RE.search(t):
+        _signal(uid, "auto_correction")
+        return
+    cur, was = _norm_words(t), _norm_words(old)
+    if cur and was:
+        _j = len(cur & was) / max(1, len(cur | was))
+        if _j >= 0.6:
+            _signal(uid, "auto_reask")
+            return
+    if _THANKS_RE.search(t):
+        _signal(uid, "auto_thanks")
 
 
 def _signal(uid, key: str) -> None:
@@ -4799,7 +4846,7 @@ WELCOME = ("👋 *Welcome!* I'm Avenor.\n\n"
            "You can also send me a *photo*, a *voice note*, or a *PDF*.")
 def _about_text() -> str:
     return ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak Danodia.\n"
-            f"Source: https://github.com/bydenvik/avenor-ai-telegram-bot (MIT)\n"
+            f"Source: https://github.com/Zevorylian/avenor-ai-telegram-bot (MIT)\n"
             f"Bot: @{_handle()} - menu buttons *+* AI answers, both. Running 24/7.")
 HELP = ("❓ *Help*\n\n"
         "You do not need commands. Just type:\n"
@@ -5814,6 +5861,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                      "save nahi hote. Band karna ho: /privacy, ya bas likho "
                                      "\"mera data use mat karo\"."))
                 await _send_plain(c.bot, chat_id, _nl)
+
+    # Automatic feedback: judged from THIS message against the previous one, then remembered.
+    if text and MEM is not None:
+        _auto_feedback(u.effective_user.id, chat_id, text)
+        _LAST_ASK[(chat_id, u.effective_user.id)] = (text, time.time())
 
     is_private = u.effective_chat.type == "private"
     # Humour is decided ONCE, in code, and then enforced below - not hoped for in a prompt.
@@ -6895,7 +6947,7 @@ _BOT_HANDLE = ""
 def _handle() -> str:
     return (_BOT_HANDLE
             or os.environ.get("BOT_HANDLE", "").strip().lstrip("@")
-            or "AvenorAlBot")
+            or "AvenorAIBot")
 
 
 def _ua_bot() -> str:
@@ -9800,21 +9852,33 @@ async def _setup_commands(app) -> None:
     setMyCommands with a scope, which is what this does.
     """
     public = [BotCommand(c, d) for c, d in PUBLIC_COMMANDS]
-    try:
-        await app.bot.set_my_commands(public)
-        log.info("command menu set (%s public commands)", len(public))
-    except Exception as e:  # noqa: BLE001
-        log.warning("set_my_commands failed: %s", e)
-    if not OWNER_IDS:
-        return
-    owner_list = public + [BotCommand(c, d) for c, d in OWNER_COMMANDS]
+    # Telegram stores a command list PER SCOPE, and a narrower scope beats the default.
+    # A chat-scoped list written by an older build therefore survives forever: the owner
+    # kept seeing 35 commands while the default list said 10. Every umbrella scope is
+    # written on every start so no stale list can outlive a deploy.
+    _scopes = (None, BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats(),
+               BotCommandScopeAllChatAdministrators())
+    for _sc in _scopes:
+        try:
+            if _sc is None:
+                await app.bot.set_my_commands(public)
+            else:
+                await app.bot.set_my_commands(public, scope=_sc)
+        except Exception as e:  # noqa: BLE001
+            log.warning("set_my_commands (%s) failed: %s",
+                        type(_sc).__name__ if _sc else "default", str(e)[:120])
+    log.info("command menu set: %s public commands on %s scopes", len(public), len(_scopes))
+
+    # The owner gets three extra commands, not six: /voicecreate, /voicelist and
+    # /voicefind are rare enough to live behind /menu.
+    _extra = {"brain", "improve", "diag"}
+    owner_list = public + [BotCommand(c, d) for c, d in OWNER_COMMANDS if c in _extra]
     for oid in OWNER_IDS:
         try:
-            await app.bot.set_my_commands(owner_list,
-                                          scope=BotCommandScopeChat(chat_id=oid))
-            log.info("owner command menu set for %s", oid)
+            await app.bot.set_my_commands(owner_list, scope=BotCommandScopeChat(chat_id=oid))
+            log.info("owner command menu set for %s (%s)", oid, len(owner_list))
         except Exception as e:  # noqa: BLE001
-            log.warning("owner command scope failed for %s: %s", oid, e)
+            log.warning("owner command scope failed for %s: %s", oid, str(e)[:120])
 
 
 async def _post_shutdown(app) -> None:
@@ -10321,6 +10385,17 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
                           "This command is for the bot owner only.")
         log.info("non-owner /diag refused for %s", getattr(u.effective_user, "id", "?"))
         return
+    # /diag is the "fix my bot" command, so it also re-publishes the command menu. That
+    # repairs a stale per-chat scope without waiting for a redeploy.
+    _app = getattr(c, "application", None)
+    if _app is not None:
+        try:
+            await _setup_commands(_app)
+            lines_note = "command menu re-published"
+        except Exception as e:  # noqa: BLE001
+            lines_note = "command menu re-publish failed: " + str(e)[:60]
+    else:
+        lines_note = ""
     lines = [f"🔑 Gemini key: {bool(GEMINI_API_KEY)}",
              f"Models: {', '.join(GEMINI_MODELS)}"
              + ("  ⚠️ from GEMINI_MODELS env - DELETE that variable to use the tuned default"
@@ -10335,6 +10410,7 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"(voice: {_chat_voice(u.effective_chat.id)})",
              f"🎙 ffmpeg: {'yes' if _ffmpeg_exe() else 'no (voice sent as audio)'}",
              f"🧠 Memory: {LOG_LINES} lines/chat",
+             f"⌨️ Commands: {len(PUBLIC_COMMANDS)} published ({lines_note})",
              f"📝 Prompt: ~{prompt_tokens_approx(sys_prompt_for(''))} tok core, "
              f"~{prompt_tokens_approx(sys_prompt_for('ek website banao'))} tok with packs "
              f"({MAX_FILES_PER_REPLY} files max, full repair on {FILE_FULL_REPAIR_COUNT})",
@@ -10961,7 +11037,8 @@ else:
     SELF_IMPROVE = False        # filled in below, once the credential vars are read
 _SELF_IMPROVE_AUTO = _SELF_IMPROVE_ENV == ""
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "bydenvik/avenor-ai-telegram-bot").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO",
+                             "Zevorylian/avenor-ai-telegram-bot").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,60}/[A-Za-z0-9_.\-]{1,80}$")
 if GITHUB_REPO and not _REPO_RE.match(GITHUB_REPO):

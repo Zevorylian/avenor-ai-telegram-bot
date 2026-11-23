@@ -1,4 +1,4 @@
-# Privacy Policy — Avenor (Telegram bot @AvenorOrbitBot)
+# Privacy Policy — Avenor (Telegram bot @AvenorAIBot)
 
 *Last updated: 23 November 2026*
 
@@ -8,7 +8,7 @@ here is aspirational.
 
 ## 1. Who we are
 
-Avenor is a personal/community AI assistant that runs as a Telegram bot at **@AvenorOrbitBot**.
+Avenor is a personal/community AI assistant that runs as a Telegram bot at **@AvenorAIBot**.
 The developer is Deepak Danodia (https://github.com/bydenvik). Contact:
 **contact.officialdeepak@gmail.com**.
 
@@ -79,6 +79,9 @@ and it is yours to switch off.
 - `humour_reject` — a reply to a joke was rejected for lecturing or inventing a quote
 - `promise_guard` — a reply was only a promise ("I'll check and tell you") and had to be replaced
 - `search_miss` — a live lookup came back empty
+- `auto_reask` — your next message asked the same thing again, so the answer missed
+- `auto_correction` — your next message corrected the answer ("galat", "aisa nahi")
+- `auto_thanks` — your next message said it worked ("thanks", "sahi hai")
 - `feedback_up` / `feedback_down` — you reacted 👍 or 👎 to one of the bot's own messages
 
 Each counter is a number. **No message text, no name, no ID and no chat is stored with it.**
@@ -99,8 +102,11 @@ default it is not — both switches start ON, and both can be turned off.
 - It does **not** delete what is already stored — `/forget` does that.
 - It does not stop the bot working; it only stops the counters.
 
-**Feedback.** A 👍 or 👎 reaction on the bot's reply is counted only when the improvement
-switch is on, and only as a number. Reactions on other people's messages are ignored.
+**Feedback.** You do not have to react to anything. The bot infers whether an answer landed from
+your **next message** — did you ask it again, correct it, or thank it — and counts that. A 👍 or 👎
+reaction is also counted when you do use one, and reactions on other people's messages are ignored.
+To compare your next message with the previous one, the previous question is held in memory (RAM)
+for up to 15 minutes and is never written to storage.
 
 ## 5. Who else sees it (sub-processors)
 

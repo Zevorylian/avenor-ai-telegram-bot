@@ -4,10 +4,10 @@ A self-hosted Telegram AI assistant that answers in your language, reads the liv
 files (HTML, PDF, CSV, code) and improves its own source code — with the owner approving every
 change. One bot file plus a prompt module, one JSON store, no database to run.
 
-- **Bot:** [@AvenorOrbitBot](https://t.me/AvenorOrbitBot)
+- **Bot:** [@AvenorAIBot](https://t.me/AvenorAIBot)
 - **Group:** [Avenor AI Community](https://t.me/AvenorAICommunity)
-- **Repository:** [github.com/bydenvik/avenor-ai-telegram-bot](https://github.com/bydenvik/avenor-ai-telegram-bot)
-- **Developer:** [bydenvik](https://github.com/bydenvik)
+- **Repository:** [github.com/Zevorylian/avenor-ai-telegram-bot](https://github.com/Zevorylian/avenor-ai-telegram-bot)
+- **Developer:** Deepak Danodia — [@Zevorylian](https://github.com/Zevorylian)
 - **Licence:** MIT — see [LICENSE](LICENSE)
 
 ---
@@ -70,7 +70,7 @@ scan, and an SSRF guard on every outbound fetch.
 ## Quick start
 
 ```bash
-git clone https://github.com/bydenvik/avenor-ai-telegram-bot.git
+git clone https://github.com/Zevorylian/avenor-ai-telegram-bot.git
 cd avenor-ai-telegram-bot
 pip install -r requirements.txt
 cp .env.example .env          # then fill in BOT_TOKEN and GEMINI_API_KEY
@@ -127,14 +127,25 @@ paste once you have pruned the dead ones.
 
 ## Commands
 
-**Everyone** — `/start` `/help` `/skills` `/about` `/id` `/info` `/ai` `/research` `/image` `/voice`
-`/voicemessage` `/setvoice` `/voicepreview` `/remind` `/reminders` `/delremind` `/feed` `/papers`
-`/define` `/holiday` `/myphoto` `/logo` `/memory` `/proactive` `/privacy` `/clear` `/forget` `/rules`
-`/setup` `/welcome` `/stats` `/safety` `/members`
+Ten, not thirty-five. A command list past ~10 stops being a menu and becomes a wall of text, so
+everything else lives behind `/menu` buttons or plain language.
 
-**Owner** — `/improve` `/brain` `/diag` `/voicecreate` `/voicelist` `/voicefind`
+**Everyone** — `/start` `/menu` `/help` `/privacy` `/memory` `/reminders` `/forget` `/voice` `/id`
+`/skills`
 
-`/help` shows each role only the commands it can use, so a member never sees a list they cannot run.
+**Owner** — the ten above, plus `/brain` `/improve` `/diag`
+
+Nothing else needs a command:
+
+- reminder → *"kal 5 baje yaad dilana"* (the model sets it; if it forgets the tag, the code sets it)
+- files → *"3 file banao: html, css, js"*
+- image → *"ek image banao ..."*
+- research → any question whose answer could have changed
+- your data → *"kya yaad hai mujhe"*, *"mera data use mat karo"*
+
+The old commands still work if typed (nothing breaks), but they are not published anywhere and the
+list is written to **every** Telegram command scope on every start, so a stale per-chat list from an
+older build cannot survive a deploy. `/diag` re-publishes it on demand.
 
 ---
 
@@ -215,9 +226,19 @@ chat it came from is not recorded.
 
 ## Privacy
 
-`/privacy` explains what is stored; `/forget` deletes it. In short: memory lives in one JSON file on
-your server, message text goes to the AI provider to produce an answer, and nothing is sold or used to
-train a model. Full detail in [privacy-policy.md](privacy-policy.md).
+`/privacy` shows the two data switches and explains what is stored; `/forget` deletes it. In short:
+memory lives in one JSON file on your server, message text goes to the AI provider to produce an
+answer, and no AI model is trained on your messages.
+
+**Data switches (default ON, like ChatGPT's "Improve the model for everyone"):**
+
+| Switch | Default | What it does |
+|---|---|---|
+| Improve the AI from my chats | ON | keeps **counters** of the bot's own mistakes |
+| Use my voice notes to improve it | ON | the same, for voice notes |
+
+Turn either off with `/privacy`, or in plain words: *"mera data use mat karo"*. No message text,
+name or ID is stored with a counter. Full detail in [privacy-policy.md](privacy-policy.md).
 
 ---
 
