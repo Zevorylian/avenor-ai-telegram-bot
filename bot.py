@@ -2463,6 +2463,22 @@ def _book_pick_file(book: dict, want_pdf: bool = False) -> tuple:
     return "", ""
 
 
+def _safe_book_name(title: str, author: str) -> str:
+    """A filename that keeps Devanagari matras intact. Pure.
+
+    Stripping everything that is not \\w deleted the vowel signs (they are combining marks,
+    not letters), so "हिंदी पुस्तक" became "हद पसतक". Only characters a filesystem really
+    rejects are removed now.
+    """
+    def clean(s: str, n: int) -> str:
+        s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", s or "")
+        s = re.sub(r"\s+", " ", s).strip(" .")
+        return s[:n]
+    t = clean(title, 60) or "book"
+    a = clean(author, 30)
+    return (t + (" - " + a if a else "")).strip()
+
+
 async def _book_download(book: dict, want_pdf: bool = False) -> tuple:
     """(filename, bytes, note). ('', b'', reason) when it cannot be fetched."""
     if not book.get("title") and book.get("page"):
@@ -2488,9 +2504,8 @@ async def _book_download(book: dict, want_pdf: bool = False) -> tuple:
             return "", b"", "too large"
     except Exception as e:  # noqa: BLE001
         return "", b"", str(e)[:80]
-    title = re.sub(r"[^\w\- ]+", "", book.get("title") or "book")[:60].strip() or "book"
-    author = re.sub(r"[^\w\- ]+", "", _book_author(book).split(",")[0])[:30].strip()
-    name = (title + (" - " + author if author else "")).strip()
+    name = _safe_book_name(book.get("title") or "book",
+                           _book_author(book).split(",")[0])
 
     # The book is rebuilt as OUR OWN PDF from its text, the way it was asked for:
     # download -> take the text out -> throw the download away (it only ever lived in
@@ -6686,40 +6701,55 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                 _signal(u.effective_user.id, "book_sent")
                                 break
                         if not _sent_book:
-                            # No raw URL in the text: Telegram turns it into a preview card
-                            # that buries the answer, and the person asked for a FILE. A
-                            # copyrighted book cannot be sent legally, so that is said
-                            # plainly and the one useful action is a button, not a link.
+                            # ONE neutral line, no lecture, no link, no button. Then the
+                            # genuinely useful move: find a FREE book on the same topic and
+                            # send THAT as a PDF. "Atomic Habits" is not free, but "Habit"
+                            # by William James is - so the person still leaves with a file.
                             _signal(u.effective_user.id, "book_miss")
-                            ans = _msg(lang,
-                                       en=("\"" + _bq[:60] + "\" is still in copyright, so I "
-                                           "cannot send its PDF - that would be piracy. I can "
-                                           "only send books that are free and legal. Name a "
-                                           "classic (Frankenstein, Sherlock Holmes, Gitanjali) "
-                                           "and the PDF comes straight away."),
-                                       hi=("\"" + _bq[:60] + "\" पर कॉपीराइट है, इसलिए इसकी PDF "
-                                           "नहीं भेज सकता - वह piracy होगी। मैं सिर्फ़ मुफ़्त और "
-                                           "कानूनी किताबें भेज सकता हूँ। कोई classic बोलिए "
-                                           "(Frankenstein, Sherlock Holmes, Gitanjali) - PDF "
-                                           "तुरंत मिलेगी।"),
-                                       hinglish=("\"" + _bq[:60] + "\" par copyright hai, "
-                                                 "isliye iski PDF nahi de sakta - wo piracy "
-                                                 "hogi. Main sirf free aur legal books bhej "
-                                                 "sakta hoon. Koi classic bolo (Frankenstein, "
-                                                 "Sherlock Holmes, Gitanjali) - PDF turant "
-                                                 "mil jayegi."))
-                            try:
-                                _ol = ("https://openlibrary.org/search?q="
-                                       + urllib.parse.quote(_bq[:80]))
-                                await rate_gate(chat_id)
-                                await c.bot.send_message(
-                                    chat_id=chat_id, text="Ya phir:",
-                                    reply_markup=InlineKeyboardMarkup([[
-                                        InlineKeyboardButton("🔎 Open Library par dekho",
-                                                             url=_ol)]]),
-                                    link_preview_options=_NO_PREVIEW)
-                            except Exception as e:  # noqa: BLE001
-                                log.debug("book button failed: %s", str(e)[:80])
+                            _alt_sent = False
+                            _words = [w for w in re.findall(r"[\w]{4,}", _bq)][:3]
+                            for _topic in ([" ".join(_words[-2:]), _words[-1] if _words else ""]):
+                                if not _topic or _topic.lower() == _bq.lower():
+                                    continue
+                                try:
+                                    _alts = await _book_search(_topic, _lang_code)
+                                except Exception:  # noqa: BLE001
+                                    _alts = []
+                                for _ab in _alts[:2]:
+                                    _an, _ad, _aw = await _book_download(_ab)
+                                    if not _ad:
+                                        continue
+                                    _atitle = (_ab.get("title") or "Book")[:90]
+                                    if await _send_book(
+                                            c.bot, chat_id, _an, _ad,
+                                            "📚 " + _atitle +
+                                            ((" — " + (_ab.get("authors") or ""))
+                                             if _ab.get("authors") else "") +
+                                            "\nProject Gutenberg · public domain"):
+                                        ans = _msg(lang,
+                                                   en="That exact book is not free, so here is "
+                                                      "a free one on the same topic: " +
+                                                      _atitle,
+                                                   hi="वह किताब मुफ़्त नहीं है, तो इसी विषय पर "
+                                                      "एक मुफ़्त किताब: " + _atitle,
+                                                   hinglish="Wo exact book free nahi hai, to "
+                                                             "isi topic par ek free book: " +
+                                                             _atitle)
+                                        _alt_sent = True
+                                        break
+                                if _alt_sent:
+                                    break
+                            if not _alt_sent:
+                                ans = _msg(lang,
+                                           en="\"" + _bq[:60] + "\" is not free. Name a "
+                                              "classic - Frankenstein, Sherlock Holmes, "
+                                              "Gitanjali - and the PDF comes straight away.",
+                                           hi="\"" + _bq[:60] + "\" मुफ़्त नहीं है। कोई classic "
+                                              "बोलिए - Frankenstein, Sherlock Holmes, Gitanjali - "
+                                              "PDF तुरंत मिलेगी।",
+                                           hinglish="\"" + _bq[:60] + "\" free nahi hai. Koi "
+                                                     "classic bolo - Frankenstein, Sherlock "
+                                                     "Holmes, Gitanjali - PDF turant milegi.")
 
             # ---- HUMOUR VERIFIER -------------------------------------------------
             # Code has the last word on a joke turn (see _humour_reply_ok).

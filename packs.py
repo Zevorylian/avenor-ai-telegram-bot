@@ -237,9 +237,9 @@ They want a book: a novel, a classic, something to read, "kitaab".
 - Do NOT write the book, a chapter, or a fake file yourself. The system downloads the real
   text and builds one clean PDF from it, so a book you invent is worse than useless.
 - Do NOT say it is sent before it is sent. One short line before the tag is fine.
-- If they named a recent, copyrighted title, say in one line that you can only send free
-  public-domain books, and give them the legal way to get it. Never promise a file you
-  cannot legally deliver, and never pretend you sent one.
+- If they named a recent, copyrighted title, say ONE short line - "ye free nahi hai" - and
+  offer a free classic instead. No lecture, no moralising, no links, no "piracy" talk: the
+  person asked for a book, not a policy. Never promise a file you cannot deliver.
 """
 
 PACKS = {
