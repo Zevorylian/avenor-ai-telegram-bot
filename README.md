@@ -152,6 +152,13 @@ list, so a Blueprint deploy needs no manual configuration.
 The full list — model chain, effort budgets, voice, group behaviour, memory limits — is in
 [`.env.example`](.env.example) with a note on every line.
 
+**The chain, ordered by real quota.** Free-tier limits are per model, and they differ by 6×:
+Gemma 4 (26B/31B) gets 30 RPM, the Flash-Lite models 10–15 RPM, and every Flash model only 5 RPM
+(one reply every 12 seconds). So the cheap, roomy models answer normal chat and the 5-RPM models
+are last resorts. If the whole chain fails, it is walked **again from the first model** — a rate
+limit is per minute, so the second pass often lands. Voice uses the separate Live models
+(`GEMINI_LIVE_MODELS`).
+
 **Why a model chain instead of one model.** Free tiers rate-limit. The bot walks
 `GEMINI_MODELS` in order, drops models that answer 404 or repeat a 500, then falls back to Groq, then
 to Pollinations. `/diag` shows which are alive right now and prints the exact `GEMINI_MODELS=` line to
@@ -185,23 +192,27 @@ older build cannot survive a deploy. `/diag` re-publishes it on demand.
 
 ## Discord
 
-The same assistant runs on Discord from the same process, as a separate task: if discord.py is
-missing or the token is wrong, the Telegram bot is unaffected.
+The bot runs beside Telegram on the same process (or as its own service with
+`RUN_TELEGRAM=false`). Slash commands: `/ask`, `/image`, `/research`, `/remind`, `/reminders`,
+plus `/join` and `/speak` when voice is on.
 
-- Answers a **DM**, an **@mention**, or **/ask** in a channel. Plain channel chatter is ignored.
-- `/channels` lists every server, category, text channel and voice channel the bot can see.
-- `/join` + `/speak` make it join your voice channel and say something — set `DISCORD_VC=true`
-  and install `PyNaCl` for that.
+**Which channels answer, and which need a command.** Three lists, no guessing:
 
-| Variable | What it is |
-|---|---|
-| `DISCORD_TOKEN` | Bot token from the Developer Portal → Bot → Reset Token |
-| `DISCORD_GUILD_ID` | The server to sync slash commands to (instant, instead of global) |
-| `DISCORD_ANSWER_IN_CHANNELS` | `true` (default) answers @mentions in channels |
-| `DISCORD_VC` | `true` enables `/join` and `/speak` |
+| List | Behaviour | Default channels |
+|---|---|---|
+| `DISCORD_AUTO_CHANNELS` | answers every message — no @mention, no command | ai-chat, research-lab, image-studio, file-desk, coding-lab, voice-lab, voice-control |
+| `DISCORD_MENTION_CHANNELS` | answers only on @Avenor or `/ask` | general, suggestions, bug-reports, introductions, showcase, how-to-use-avenor |
+| `DISCORD_IGNORE_CHANNELS` | never answers, not even when mentioned | admin, admin-room, mod-log, bot-logs, logs, rules |
 
-`DISCORD_APPLICATION_ID` and `DISCORD_PUBLIC_KEY` are **not** needed for a gateway bot — those
-are for HTTP interactions. Only the bot token is required.
+A channel in none of the lists answers freely, so the bot is never mysteriously silent. An
+explicit `DISCORD_CHANNELS` allowlist still overrides all three.
+
+**Voice.** With `DISCORD_VC=true`, the bot walks into `avenor-live` (configurable) by itself when
+a person joins, speaks the answer it gives in the paired text channels (`DISCORD_SPEAK_CHANNELS`),
+and leaves when the channel empties. Hearing the *person* needs a voice-receive library —
+discord.py cannot receive audio on its own — so voice input is the next step, not a claim.
+
+---
 
 ## Effort routing
 

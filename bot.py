@@ -146,22 +146,45 @@ _models_env = os.environ.get("GEMINI_MODELS", "").strip()
 GEMINI_MODELS_FROM_ENV = bool(_models_env)
 # Tuned chain, ordered by HOW MUCH FREE QUOTA each model gives - the model that can answer
 # the most requests per day goes first, the scarce ones are last-resort only.
-MODEL_RPD = {
-    "gemini-3.5-flash-lite": "~500", "gemini-3.1-flash-lite": "~500",
-    "gemma-4-31b-it": "large", "gemma-4-26b-a4b-it": "large",
-    "gemini-3-flash-preview": "free", "gemini-3.6-flash": "~20",
-}
+# (MODEL_RPD was replaced by MODEL_RPM above - real RPM numbers, not a guess)
+# The chain, ordered by how much room each model actually has on the free tier - the
+# numbers below are from the project's own AI Studio rate-limit page, not guesses:
+#   Gemma 4 26B/31B  30 RPM   <- by far the most room, so they carry normal chat
+#   3.1 Flash Lite   15 RPM
+#   3.5 Flash Lite   15 RPM
+#   2.5 Flash Lite   10 RPM
+#   2.5 Flash / 3 Flash / 3.6 Flash / 3.8 Flash   5 RPM each
+# Anything with 5 RPM is a last resort: one reply every 12 seconds, so it cannot be the
+# model that answers a busy group.
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
-    "gemini-3.5-flash-lite",   # ~500 RPD - the workhorse, most available
-    "gemini-3.1-flash-lite",   # ~500 RPD
-    "gemini-3-flash-preview",  # free tier, proved OK on the live self-test
-    "gemma-4-31b-it",          # free-only tier, huge allowance (weaker, so lower down)
-    "gemini-3.6-flash",        # ~20 RPD - scarce, last resort only
-    # gemini-3.8-flash is deliberately NOT here: ~20 requests/day, so it answered a handful
-    # of messages and then sat out the rest of the day while the chain paid the latency of
-    # trying it. Quality you cannot reach is worth nothing; five reachable models beat six
-    # with one dead.
+    "gemma-4-26b-a4b-it",      # 30 RPM
+    "gemma-4-31b-it",          # 30 RPM
+    "gemini-2.5-flash-lite",   # 10 RPM
+    "gemini-3.1-flash-lite",   # 15 RPM
+    "gemini-3.5-flash-lite",   # 15 RPM
+    "gemini-2.5-flash",        # 5 RPM
+    "gemini-3-flash-preview",  # 5 RPM
+    "gemini-3.6-flash",        # 5 RPM
+    "gemini-3.8-flash",        # 5 RPM - best quality, scarcest
 ]
+# Requests-per-minute per model, for /diag and for the ordering above. Free tier, measured
+# on this project's own AI Studio page.
+MODEL_RPM = {
+    "gemma-4-26b-a4b-it": 30, "gemma-4-31b-it": 30,
+    "gemini-3.1-flash-lite": 15, "gemini-3.5-flash-lite": 15,
+    "gemini-2.5-flash-lite": 10,
+    "gemini-2.5-flash": 5, "gemini-3-flash-preview": 5,
+    "gemini-3.6-flash": 5, "gemini-3.8-flash": 5,
+}
+# How many times the WHOLE chain is walked before giving up. "Last one failed too? start
+# again from the first" - a rate limit is per minute, so the second pass often succeeds.
+MODEL_CHAIN_PASSES = max(1, int(os.environ.get("MODEL_CHAIN_PASSES", "2") or "2"))
+# Voice / real-time: these are the Live API models on the same key (unlimited RPM on the
+# free tier, per the same page). Used for the Discord voice channel and any live session.
+GEMINI_LIVE_MODELS = [m.strip() for m in os.environ.get(
+    "GEMINI_LIVE_MODELS",
+    "gemini-3.8-live,gemini-3-flash-live,gemini-2.5-flash-native-audio-dialog").split(",")
+    if m.strip()]
 
 _tts_env = os.environ.get("TTS_MODELS", "").strip()
 TTS_MODELS = [m.strip() for m in _tts_env.split(",") if m.strip()] or [
@@ -4820,7 +4843,15 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0, effort: str = "
     patience = EFFORT_PATIENCE.get(effort, 2)
     _retried_503 = False          # only one 503-retry per walk, so it cannot stall us
     deadline = (time.monotonic() + budget) if budget else 0.0
-    for model in _model_order():
+    # Two passes: the order is walked again from the FIRST model, and a model that just
+    # answered 429 is skipped on the second pass (its cooldown is set by then). This is the
+    # "if the last one fails too, start again" rule.
+    _queue: list = []
+    for _p in range(MODEL_CHAIN_PASSES):
+        _queue.extend(_model_order())
+    for model in _queue:
+        if _MODEL_COOLDOWN.get(model, 0) > time.time():
+            continue          # rate-limited a moment ago: do not hammer it again
         if deadline and time.monotonic() > deadline:
             log.warning("model walk hit its %.0fs budget - stopping", budget)
             break
@@ -10199,11 +10230,35 @@ _DISCORD_BASE = 10 ** 15       # Discord pseudo chat ids live from here down; Te
 #   DISCORD_CHANNELS set   -> answer only in those channels (names or ids).
 DISCORD_CHANNELS = {c.strip().lower().lstrip("#")
                     for c in os.environ.get("DISCORD_CHANNELS", "").split(",") if c.strip()}
-DISCORD_IGNORE_CHANNELS = {c.strip().lower().lstrip("#")
-                           for c in os.environ.get(
-                               "DISCORD_IGNORE_CHANNELS",
-                               "admin,admin-room,mod-log,bot-logs,logs,rules,welcome,"
-                               "announcements,voice-control").split(",") if c.strip()}
+def _names(env_key: str, default: str) -> set:
+    """A set of lower-case channel names from an env var. Pure."""
+    raw = os.environ.get(env_key, default)
+    return {c.strip().lower().lstrip("#") for c in raw.split(",") if c.strip()}
+
+
+# Three lists, so the answer is never a mystery:
+#   AUTO     - answers every message, no @mention, no command. The AI work rooms.
+#   MENTION  - answers only when @mentioned or replied to. Chatty community rooms, where an
+#              always-on bot would talk over people.
+#   NEVER    - housekeeping. It does not answer even when mentioned (rules, logs, admin).
+# A channel that is in none of the lists answers freely (so the bot is never mysteriously
+# silent in a new channel) - add it to MENTION if you want it quieter.
+DISCORD_AUTO_CHANNELS = _names(
+    "DISCORD_AUTO_CHANNELS",
+    "ai-chat,research-lab,image-studio,file-desk,coding-lab,voice-lab,voice-control,"
+    "tile-desk,ask-avenor,bot-testing")
+DISCORD_MENTION_CHANNELS = _names(
+    "DISCORD_MENTION_CHANNELS",
+    "general,suggestions,bug-reports,introductions,showcase,how-to-use-avenor,memory-guide,"
+    "announcements,welcome")
+DISCORD_IGNORE_CHANNELS = _names(
+    "DISCORD_IGNORE_CHANNELS",
+    "admin,admin-room,mod-log,bot-logs,logs,rules")
+# Voice: the bot joins this voice channel by itself when a person enters it, and speaks the
+# answers it gives in the paired text channels. Set DISCORD_VOICE_CHANNEL="" to turn the
+# auto-join off and keep only the /join command.
+DISCORD_VOICE_CHANNEL = os.environ.get("DISCORD_VOICE_CHANNEL", "avenor-live").strip()
+DISCORD_SPEAK_CHANNELS = _names("DISCORD_SPEAK_CHANNELS", "voice-lab,voice-control,avenor-live")
 DISCORD_COOLDOWN = float(os.environ.get("DISCORD_COOLDOWN", "2") or "2")
 DISCORD_MAX_PER_MIN = int(os.environ.get("DISCORD_MAX_PER_MIN", "12") or "12")
 _DISCORD_LAST: dict = {}       # channel id -> last answer time
@@ -10244,17 +10299,28 @@ def _discord_channel_of(chat_id) -> int:
         return 0
 
 
-def _discord_channel_allowed(channel) -> bool:
-    """Should the bot answer here without being @mentioned?
+def _discord_policy(channel) -> str:
+    """'auto' | 'mention' | 'never' for this channel. Pure.
 
-    An explicit DISCORD_CHANNELS list wins; otherwise every channel answers except the
-    housekeeping ones (admin/mod/log/rules), where it still answers when mentioned.
+    Explicit DISCORD_CHANNELS still wins outright (an allowlist is an allowlist). Otherwise
+    the three named lists decide, and an unknown channel is 'auto'.
     """
     name = (getattr(channel, "name", "") or "").lower().lstrip("#")
     cid = str(getattr(channel, "id", "") or "")
     if DISCORD_CHANNELS:
-        return name in DISCORD_CHANNELS or cid in DISCORD_CHANNELS
-    return name not in DISCORD_IGNORE_CHANNELS
+        return "auto" if (name in DISCORD_CHANNELS or cid in DISCORD_CHANNELS) else "never"
+    if name in DISCORD_IGNORE_CHANNELS or cid in DISCORD_IGNORE_CHANNELS:
+        return "never"
+    if name in DISCORD_AUTO_CHANNELS:
+        return "auto"
+    if name in DISCORD_MENTION_CHANNELS:
+        return "mention"
+    return "auto"
+
+
+def _discord_channel_allowed(channel) -> bool:
+    """Should the bot answer here without being @mentioned?"""
+    return _discord_policy(channel) == "auto"
 
 
 def _discord_gate(message, bot_user) -> tuple:
@@ -10278,8 +10344,12 @@ def _discord_gate(message, bot_user) -> tuple:
     if getattr(message, "guild", None) is not None:
         if not DISCORD_ANSWER_IN_CHANNELS:
             return False, "DISCORD_ANSWER_IN_CHANNELS=false"
-        if not mentioned and not _discord_channel_allowed(channel):
+        _pol = _discord_policy(channel)
+        if _pol == "never":
             return False, f"#{getattr(channel, 'name', '?')} is a no-answer channel"
+        if _pol == "mention" and not mentioned:
+            return False, (f"#{getattr(channel, 'name', '?')} needs an @mention "
+                           f"(or /ask)")
         if not _discord_rate_ok(getattr(channel, "id", 0)):
             return False, "rate limited (cooldown or per-minute cap)"
     return True, "ok"
@@ -10370,6 +10440,42 @@ async def _discord_prepare_media(message):
     if not txt.strip():
         return None, None, None, "failed", ""
     return None, None, (txt.encode("utf-8"), "text/plain"), "doc_loaded", ""
+
+
+async def _discord_speak(guild, text: str) -> bool:
+    """Say the answer OUT LOUD in the voice channel the bot is sitting in.
+
+    This is the "talk to it in the voice channel" half that a bot can do today: the answer
+    is spoken with the same TTS the Telegram side uses. Hearing the PERSON needs a voice
+    receive library (discord.py cannot receive audio by itself) - see README.
+    """
+    if not text:
+        return False
+    try:
+        import discord
+    except ImportError:
+        return False
+    vc = getattr(guild, "voice_client", None)
+    if vc is None or not getattr(vc, "is_connected", lambda: False)():
+        return False
+    try:
+        wav, _model = await tts_wav((text or "")[:TTS_MAX_CHARS], "english")
+        if not wav:
+            return False
+        ogg = await wav_to_ogg_opus(wav)
+        if not ogg:
+            return False
+        _exe = _ffmpeg_exe() or "ffmpeg"
+        for _ in range(40):                    # wait for the previous line to finish
+            if not vc.is_playing():
+                break
+            await asyncio.sleep(0.25)
+        vc.play(discord.FFmpegPCMAudio(io.BytesIO(ogg), pipe=True, executable=_exe))
+        log.info("discord: spoke the answer in %s", getattr(vc.channel, "name", "?"))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("discord: speaking failed (%s)", str(e)[:120])
+        return False
 
 
 async def _discord_send_voice(channel, text: str) -> bool:
@@ -10540,6 +10646,12 @@ async def _discord_handle_message(message, client, discord) -> None:
         return
     for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
         await message.reply(chunk, mention_author=False)
+    # If the bot is in the voice channel, the same answer is also spoken there, so a person
+    # sitting in avenor-live hears it without reading.
+    _guild = getattr(channel, "guild", None)
+    if (DISCORD_VC and _guild is not None
+            and (getattr(channel, "name", "") or "").lower() in DISCORD_SPEAK_CHANNELS):
+        await _discord_speak(_guild, out)
 
 
 async def _discord_runner() -> None:
@@ -10767,6 +10879,34 @@ async def _discord_runner() -> None:
         try:
             import nacl  # presence check: voice needs it
             _ = nacl.__version__ if hasattr(nacl, '__version__') else True
+
+            @client.event
+            async def on_voice_state_update(member, before, after):  # noqa: ANN202
+                """Walk into the voice channel when a person does, leave when it empties."""
+                try:
+                    if getattr(member, "bot", False) or not DISCORD_VOICE_CHANNEL:
+                        return
+                    guild = getattr(member, "guild", None)
+                    if guild is None:
+                        return
+                    _target = DISCORD_VOICE_CHANNEL.lower()
+                    _joined = getattr(after, "channel", None)
+                    if _joined is not None and (_joined.name or "").lower() == _target:
+                        vc = guild.voice_client
+                        if vc is None:
+                            await _joined.connect(self_deaf=False)
+                            log.info("discord: joined voice channel '%s'", _joined.name)
+                        elif getattr(vc, "channel", None) != _joined:
+                            await vc.move_to(_joined)
+                    vc = guild.voice_client
+                    if (vc is not None and getattr(vc, "channel", None) is not None
+                            and (vc.channel.name or "").lower() == _target):
+                        _humans = [m for m in vc.channel.members if not m.bot]
+                        if not _humans:
+                            await vc.disconnect()
+                            log.info("discord: left voice channel '%s' (empty)", _target)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("discord: voice state update failed (%s)", str(e)[:120])
 
             @tree.command(name="join", description="Join your voice channel")
             async def _join(interaction):  # noqa: ANN001, ANN202
@@ -11479,8 +11619,9 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"Models: {', '.join(GEMINI_MODELS)}"
              + ("  ⚠️ from GEMINI_MODELS env - DELETE that variable to use the tuned default"
                 if GEMINI_MODELS_FROM_ENV else "  (tuned default)"),
-             "Free quota (approx): " + ", ".join(
-                 f"{m}={MODEL_RPD.get(m, '?')}/day" for m in GEMINI_MODELS[:4]),
+             "Rate limit (free tier): " + ", ".join(
+                 f"{m}={MODEL_RPM.get(m, '?')}rpm" for m in GEMINI_MODELS[:5])
+             + f" | chain walked {MODEL_CHAIN_PASSES}x before giving up",
              f"🔑 Groq: {bool(GROQ_API_KEY)} (chat fallback + Whisper)",
              "🌐 Pollinations text fallback: "
              + ("ON (opt-in)" if POLLINATIONS_TEXT_ENABLED else "off (opt-in only)"),
