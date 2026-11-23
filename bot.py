@@ -93,7 +93,7 @@ from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReactionTypeEmoji, ReplyParameters, BotCommand,
+                      ReactionTypeEmoji, ReplyParameters, BotCommand, LinkPreviewOptions,
                       BotCommandScopeChat, BotCommandScopeAllPrivateChats,
                       BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators,
                       ChatPermissions, InputMediaDocument)
@@ -2318,6 +2318,98 @@ def _strip_gutenberg(text: str) -> str:
     return t.strip()
 
 
+BOOK_MAX_PAGES = int(os.environ.get("BOOK_MAX_PAGES", "120") or "120")
+
+
+def _book_font() -> str:
+    """A Unicode font that can draw Devanagari. '' when none is available."""
+    cand = os.environ.get("BOOK_FONT_PATH", "").strip()
+    if cand and os.path.exists(cand):
+        return cand
+    for p in (os.path.join(_HERE, "assets", "NotoSansDevanagari-Regular.ttf"),
+              "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+              "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf"):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def _text_to_pdf_rendered(text: str, title: str = "Avenor") -> bytes:
+    """A real PDF whose pages are IMAGES of the text, drawn with a Unicode font.
+
+    Used only when the text is not Latin: the vector writer uses the 14 standard PDF fonts
+    and would turn "अ" into "?". Here the words are rendered by Pillow with a font that has
+    the glyphs, then wrapped in a PDF, so a Hindi book reads correctly. The text is not
+    selectable - that is the price of not embedding a font program in the PDF.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception as e:  # noqa: BLE001
+        log.info("rendered pdf: Pillow missing (%s)", str(e)[:60])
+        return b""
+    path = _book_font()
+    if not path:
+        log.info("rendered pdf: no Unicode font found")
+        return b""
+    W, H, M, FS = 1240, 1754, 96, 30          # A4 at 96 dpi
+    try:
+        font = ImageFont.truetype(path, FS)
+    except Exception as e:  # noqa: BLE001
+        log.info("rendered pdf: font load failed (%s)", str(e)[:60])
+        return b""
+    scratch = ImageDraw.Draw(Image.new("RGB", (8, 8), "white"))
+    limit = W - 2 * M
+
+    def wrap(line: str) -> list:
+        out, cur = [], ""
+        for word in (line or "").split(" "):
+            trial = (cur + " " + word).strip()
+            if scratch.textlength(trial, font=font) <= limit:
+                cur = trial
+                continue
+            if cur:
+                out.append(cur)
+            cur = word
+            while len(cur) > 1 and scratch.textlength(cur, font=font) > limit:
+                k = len(cur)
+                while k > 1 and scratch.textlength(cur[:k], font=font) > limit:
+                    k -= 1
+                out.append(cur[:k])
+                cur = cur[k:]
+        out.append(cur)
+        return out or [""]
+
+    lines = []
+    for raw in (text or "").splitlines():
+        lines.extend(wrap(raw.rstrip()) if raw.strip() else [""])
+    per_page = (H - 2 * M - 80) // int(FS * 1.6)
+    pages, made = [], 0
+    for start in range(0, len(lines), per_page):
+        if made >= BOOK_MAX_PAGES:
+            break
+        img = Image.new("RGB", (W, H), "white")
+        d = ImageDraw.Draw(img)
+        y = M
+        try:
+            d.text((M, y), (title or "")[:60], font=ImageFont.truetype(path, 40),
+                   fill="black")
+        except Exception:  # noqa: BLE001
+            pass
+        y += 80
+        for ln in lines[start:start + per_page]:
+            d.text((M, y), ln, font=font, fill="black")
+            y += int(FS * 1.6)
+        pages.append(img)
+        made += 1
+    if not pages:
+        return b""
+    buf = io.BytesIO()
+    pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:],
+                  resolution=96.0)
+    log.info("rendered pdf: %s pages, %s bytes", len(pages), len(buf.getvalue()))
+    return buf.getvalue()
+
+
 def _latin_ok(text: str) -> bool:
     """Can the built-in PDF writer represent this text? Pure.
 
@@ -2423,10 +2515,15 @@ async def _book_download(book: dict, want_pdf: bool = False) -> tuple:
             except Exception as e:  # noqa: BLE001
                 log.info("book pdf build failed: %s", str(e)[:80])
         else:
-            # Devanagari/Bengali/Tamil etc: the built-in writer is Latin-1 only, so a PDF
-            # would be full of "?". The readable file wins over the pretty format.
-            data = text[:BOOK_TEXT_LIMIT].encode("utf-8")
-            ext = "txt"
+            # Devanagari/Bengali/Tamil etc. The vector writer is Latin-1 only, so the pages
+            # are rendered as images with a Unicode font instead - a real PDF that reads
+            # correctly. Only if no font exists does the plain text win.
+            _rendered = _text_to_pdf_rendered(text[:BOOK_TEXT_LIMIT], name)
+            if _rendered:
+                data, ext = _rendered, "pdf"
+            else:
+                data = text[:BOOK_TEXT_LIMIT].encode("utf-8")
+                ext = "txt"
     return f"{name}.{ext}", data, ""
 
 
@@ -5837,10 +5934,16 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         USER_BUSY.discard(busy_key)
 
 
+# A raw URL in a reply gets expanded by Telegram into a big preview card that pushes the
+# actual answer off the screen - the bot never sends a preview card again. A link the person
+# may want is a BUTTON, not a wall of card.
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
 async def _send_plain(bot, chat_id: int, text: str) -> None:
     await rate_gate(chat_id)
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text, link_preview_options=_NO_PREVIEW)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
         try:
@@ -5858,7 +5961,8 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
     for _ in range(2):
         try:
             _sent = await u.message.reply_text(html, parse_mode="HTML",
-                                               reply_parameters=reply_parameters)
+                                               reply_parameters=reply_parameters,
+                                               link_preview_options=_NO_PREVIEW)
             if _sent is not None:
                 _BOT_MSGS[chat_id].append(_sent.message_id)
             return
@@ -5870,7 +5974,8 @@ async def _safe_send(u: Update, c: ContextTypes.DEFAULT_TYPE, html: str, plain: 
             break
     try:
         # Never show raw '**' if the HTML was rejected - strip the markers instead.
-        await u.message.reply_text(md_to_plain(plain), reply_parameters=reply_parameters)
+        await u.message.reply_text(md_to_plain(plain), reply_parameters=reply_parameters,
+                                   link_preview_options=_NO_PREVIEW)
         return
     except Exception as e:  # noqa: BLE001
         log.warning("Plain reply failed (%s), sending without reply link", e)
@@ -6581,23 +6686,40 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                 _signal(u.effective_user.id, "book_sent")
                                 break
                         if not _sent_book:
-                            _ol = ("https://openlibrary.org/search?q=" +
-                                   urllib.parse.quote(_bq[:80]))
+                            # No raw URL in the text: Telegram turns it into a preview card
+                            # that buries the answer, and the person asked for a FILE. A
+                            # copyrighted book cannot be sent legally, so that is said
+                            # plainly and the one useful action is a button, not a link.
                             _signal(u.effective_user.id, "book_miss")
                             ans = _msg(lang,
-                                       en=("\"" + _bq[:60] + "\" is not in the free "
-                                           "public-domain catalogue I can legally send. "
-                                           "Legal places to get it: " + _ol +
-                                           " (borrow) or the publisher. If it is an older "
-                                           "classic, give me the author and I will look again."),
-                                       hi=("\"" + _bq[:60] + "\" मुफ़्त पब्लिक-डोमेन सूची में "
-                                           "नहीं है, जिसे मैं कानूनी रूप से भेज सकूँ। कानूनी "
-                                           "विकल्प: " + _ol + " (उधार) या प्रकाशक।"),
-                                       hinglish=("\"" + _bq[:60] + "\" free public-domain "
-                                                 "list me nahi hai, jo main legally bhej sakoon. "
-                                                 "Legal option: " + _ol + " (borrow) ya "
-                                                 "publisher. Purani classic ho to author batao, "
-                                                 "dobara dekh leta hoon."))
+                                       en=("\"" + _bq[:60] + "\" is still in copyright, so I "
+                                           "cannot send its PDF - that would be piracy. I can "
+                                           "only send books that are free and legal. Name a "
+                                           "classic (Frankenstein, Sherlock Holmes, Gitanjali) "
+                                           "and the PDF comes straight away."),
+                                       hi=("\"" + _bq[:60] + "\" पर कॉपीराइट है, इसलिए इसकी PDF "
+                                           "नहीं भेज सकता - वह piracy होगी। मैं सिर्फ़ मुफ़्त और "
+                                           "कानूनी किताबें भेज सकता हूँ। कोई classic बोलिए "
+                                           "(Frankenstein, Sherlock Holmes, Gitanjali) - PDF "
+                                           "तुरंत मिलेगी।"),
+                                       hinglish=("\"" + _bq[:60] + "\" par copyright hai, "
+                                                 "isliye iski PDF nahi de sakta - wo piracy "
+                                                 "hogi. Main sirf free aur legal books bhej "
+                                                 "sakta hoon. Koi classic bolo (Frankenstein, "
+                                                 "Sherlock Holmes, Gitanjali) - PDF turant "
+                                                 "mil jayegi."))
+                            try:
+                                _ol = ("https://openlibrary.org/search?q="
+                                       + urllib.parse.quote(_bq[:80]))
+                                await rate_gate(chat_id)
+                                await c.bot.send_message(
+                                    chat_id=chat_id, text="Ya phir:",
+                                    reply_markup=InlineKeyboardMarkup([[
+                                        InlineKeyboardButton("🔎 Open Library par dekho",
+                                                             url=_ol)]]),
+                                    link_preview_options=_NO_PREVIEW)
+                            except Exception as e:  # noqa: BLE001
+                                log.debug("book button failed: %s", str(e)[:80])
 
             # ---- HUMOUR VERIFIER -------------------------------------------------
             # Code has the last word on a joke turn (see _humour_reply_ok).
@@ -6737,9 +6859,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             if _e == "pdf":
                                 if _text_src.strip() and _latin_ok(_text_src):
                                     _made.append((_base + ".pdf", _text_src))
+                                elif _text_src.strip() and _book_font():
+                                    # Non-Latin script: the pages are rendered as images with
+                                    # a Unicode font, so the PDF still reads correctly.
+                                    _made.append((_base + ".pdf", _text_src))
                                 elif _text_src.strip():
-                                    # Devanagari cannot be drawn by the built-in writer; a
-                                    # .txt with the real words beats a PDF full of "?".
                                     _made.append((_base + ".txt", _text_src))
                                     _note_pdf_txt = True
                             elif _e in ("md", "txt") and _text_src.strip():
@@ -7740,6 +7864,8 @@ class _Progress:
         self.delay = delay
         self._task = None
         self._msg = None
+        self._sending = False       # a send is in flight right now
+        self._cleared = False       # the answer already landed
 
     async def arm(self) -> None:
         if not self.text:
@@ -7749,17 +7875,27 @@ class _Progress:
     async def _later(self) -> None:
         try:
             await asyncio.sleep(self.delay)
-            await rate_gate(self.chat_id)
-            self._msg = await self.bot.send_message(chat_id=self.chat_id, text=self.text)
         except asyncio.CancelledError:
+            raise                        # cancelled while still sleeping: nothing was sent
+        try:
+            await rate_gate(self.chat_id)
+            self._sending = True
+            self._msg = await self.bot.send_message(chat_id=self.chat_id, text=self.text,
+                                                    link_preview_options=_NO_PREVIEW)
+            self._sending = False
+            if self._cleared:
+                # The answer landed while this bubble was being created. Deleting it from
+                # here is the only way it does not stay in the chat forever - this exact
+                # race left "⏳ Kaam chal raha hai…" under a finished answer.
+                await self._delete_now()
+        except asyncio.CancelledError:
+            self._sending = False
             raise
         except Exception as e:  # noqa: BLE001
+            self._sending = False
             log.debug("progress bubble failed: %s", str(e)[:100])
 
-    async def finish(self) -> None:
-        """Remove the bubble. Safe to call whether or not it ever appeared."""
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
+    async def _delete_now(self) -> None:
         if self._msg is None:
             return
         try:
@@ -7768,6 +7904,28 @@ class _Progress:
         except Exception as e:  # noqa: BLE001
             log.debug("could not remove the progress bubble: %s", str(e)[:100])
         self._msg = None
+
+    async def finish(self) -> None:
+        """Remove the bubble. Safe to call whether or not it ever appeared."""
+        self._cleared = True
+        _t = self._task
+        if _t is not None and not _t.done():
+            if self._msg is None and not self._sending:
+                # Still sleeping: cancelling here means the bubble is never created.
+                _t.cancel()
+                try:
+                    await _t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    # We cancelled this task ourselves, so its CancelledError is expected.
+                    pass
+            else:
+                # Already talking to Telegram. Cancelling mid-send leaves an orphan the
+                # bot can never delete, so let it finish and then remove it.
+                try:
+                    await asyncio.wait_for(asyncio.shield(_t), timeout=4)
+                except Exception:  # noqa: BLE001
+                    pass
+        await self._delete_now()
 
 
 def _progress_text(lang: str, text: str) -> str:

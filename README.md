@@ -35,6 +35,9 @@ document you can open, not text with a `.pdf` name. One reply can carry up to si
 as a single album, so "make a website" produces `index.html` + `style.css` + `app.js` instead of one
 1,500-line page. A reply that promises a file always carries one.
 
+**No link cards, ever.** Every reply disables Telegram's link preview, so an answer is never
+buried under a preview card; when a link is genuinely useful it is a button, not a URL in the text.
+
 **Sends real books, rebuilt as one clean PDF.** Ask in plain words — *"mujhe Frankenstein
 chahiye"* — and the bot searches Project Gutenberg (Gutendex, no key, 70k+ titles, filtered to
 `copyright=false`), then gutenberg.org's own search. It downloads the source **in memory only**,
@@ -47,8 +50,10 @@ Habits*) was served from it as "public domain". Only sources that are public dom
 construction are used now.
 
 The model is explicitly told **not** to write the book itself — a fabricated book is worse than
-no book. If the text is Devanagari/Tamil/Bengali the PDF writer cannot draw it (Latin-1 only), so
-the readable TXT is sent instead of a PDF full of question marks. A title that is still in
+no book. Hindi/Bengali/Tamil books also come out as a real **PDF**: the vector writer is Latin-1
+only, so those pages are rendered as images with the bundled Noto Devanagari font (see
+`assets/`) and wrapped in a PDF. Only if no font is present does a `.txt` win over a PDF full of
+question marks. A title that is still in
 copyright gets an honest line and a legal link (Open Library / publisher) — shadow libraries are
 deliberately not wired in.
 
@@ -84,6 +89,7 @@ scan, and an SSRF guard on every outbound fetch.
 |---|---|
 | `bot.py` | Handlers, commands, model chain, research, file building, self-improvement |
 | `packs.py` | The prompt: 12 always-on CORE rules plus the packs each message needs |
+| `assets/` | The bundled Noto Devanagari font (OFL) used for Hindi/regional PDFs |
 | `memory.py` | The JSON store: users, chats, notes, reminders, profiles |
 | `.env.example` | Every setting, with its default |
 | `privacy-policy.md` | What is stored and what leaves the server |
