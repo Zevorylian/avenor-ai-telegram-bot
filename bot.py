@@ -6267,24 +6267,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             await _safe_send(u, c, md_to_html(_cl), _cl)
             return
 
-    # One-time, honest notice. The setting is ON by default, so the person is told on the
-    # first message - not buried in a document nobody opens.
-    if MEM is not None and text:
-        _uid0 = u.effective_user.id
-        if not MEM.get_user_flag(_uid0, "seen_notice", 0):
-            if MEM.set_user_flag(_uid0, "seen_notice", 1):
-                _nl = _msg(_lang_for(u),
-                           en=("Heads-up: I keep anonymous counts of my own mistakes so I can "
-                               "improve (default ON). Your messages are not stored for this. "
-                               "Turn it off any time: /privacy, or just say \"don't use my data\"."),
-                           hi=("सूचना: अपनी गलतियाँ सुधारने के लिए मैं गिनती रखता हूँ (डिफ़ॉल्ट चालू)। "
-                               "इसके लिए आपके संदेश नहीं रखे जाते। बंद करने के लिए /privacy।"),
-                           hinglish=("Sun lo ek baat: apni galtiyan sudharne ke liye main sirf "
-                                     "ginti rakhta hoon (default ON) - tumhare messages iske liye "
-                                     "save nahi hote. Band karna ho: /privacy, ya bas likho "
-                                     "\"mera data use mat karo\"."))
-                await _send_plain(c.bot, chat_id, _nl)
-
+    # The data-use notice is GONE on purpose. It fired in the middle of a request ("make me a
+    # website" got a privacy announcement), and telling every new person that a switch exists
+    # and can be turned off is an invitation to turn it off - which stops the counters that
+    # /improve learns from. The setting stays on by default and /privacy still shows both
+    # switches, so the information is available without being pushed.
     # Automatic feedback: judged from THIS message against the previous one, then remembered.
     if text and MEM is not None:
         _auto_feedback(u.effective_user.id, chat_id, text)
@@ -6637,6 +6624,16 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             ans = _SEARCH_TAG_RE.sub("", ans or "")      # never leak a tag to the user
             ans = _CALC_RE.sub("", ans or "")
             _t3 = time.monotonic()
+
+            # ---- FACTS GUARD -----------------------------------------------------
+            # Runs whenever a link's facts block is in play. Numbers that were never fetched
+            # must not reach the person, whatever the model decides to write.
+            if ans and link_text and ("=== YOUTUBE FACTS" in link_text
+                                      or "missing:" in link_text
+                                      or "engagement: not available" in link_text):
+                if not _facts_reply_ok(ans, link_text):
+                    ans = await _facts_fix(chat_id, ans, link_text, lang, image, audio, doc)
+                    _signal(u.effective_user.id, "facts_reject")
 
             # ---- FREE BOOKS ------------------------------------------------------
             # No command and no keyword: the model marks the intent with [book: ...], and a
@@ -8230,6 +8227,99 @@ def _mojeek_lines(html: str, n: int) -> list:
     return out
 
 
+_NUM_VIEW_RE = re.compile(
+    r"\d[\d,.]*\s*(?:k|m|million|lakh|crore|thousand)?\s*(?:views?|vyoo?ws|व्यू)", re.I)
+_NUM_LIKE_RE = re.compile(
+    r"\d[\d,.]*\s*(?:k|m|thousand|lakh)?\s*(?:likes?|reposts?|retweets?|shares?)", re.I)
+_NUM_COMMENT_RE = re.compile(
+    r"\d[\d,.]*\s*(?:k|m|thousand|lakh)?\s*(?:comments?|comm\b|कमेंट)", re.I)
+_TOP_COMMENTS_RE = re.compile(r"(?:top|best|सबसे)\s*\d*\s*(?:comments?|कमेंट)", re.I)
+_QUOTED_RE = re.compile(r"[\"\u201c\u201d']([^\"\u201c\u201d']{15,140})[\"\u201c\u201d']")
+
+
+def _facts_missing(facts: str) -> set:
+    """Which fields the fetch could not get, from a `missing: a, b` line. Pure."""
+    if "engagement: not available" in (facts or "").lower():
+        return {"views", "likes", "comments"}
+    m = re.search(r"^missing:\s*(.+)$", facts or "", re.M)
+    if not m:
+        return set()
+    return {x.strip().lower() for x in re.split(r"[,/]", m.group(1)) if x.strip()}
+
+
+def _facts_title(facts: str) -> str:
+    m = re.search(r"^title:\s*(.+)$", facts or "", re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _facts_reply_ok(ans: str, facts: str) -> bool:
+    """Is this reply built from the facts we actually fetched? Pure.
+
+    A free model handed "missing: views, comments" once answered "1.4 million views" and
+    invented five comments with like counts. The prompt says not to; the code makes sure.
+    """
+    t = ans or ""
+    miss = _facts_missing(facts)
+    if not miss:
+        return True
+    if "views" in miss and _NUM_VIEW_RE.search(t):
+        return False
+    if "comments" in miss and (_NUM_COMMENT_RE.search(t) or _TOP_COMMENTS_RE.search(t)):
+        return False
+    if "likes" in miss and _NUM_LIKE_RE.search(t):
+        return False
+    real = _facts_title(facts)
+    if real:
+        for q in _QUOTED_RE.findall(t):
+            qn = re.sub(r"\s+", " ", q).strip().lower()
+            if len(qn) > 20 and qn not in real.lower() and real.lower() not in qn:
+                return False          # a different title, invented
+    return True
+
+
+def _facts_fallback(facts: str, lang: str) -> str:
+    """The honest answer when the model keeps inventing. Pure."""
+    title = _facts_title(facts)
+    miss = _facts_missing(facts)
+    _bits = []
+    m = re.search(r"^channel:\s*(.+)$", facts or "", re.M)
+    if m:
+        _bits.append(m.group(1).strip())
+    if title:
+        _bits.append(title)
+    head = " — ".join(_bits) if _bits else "Video"
+    which = ", ".join(sorted(miss)) or "kuch data"
+    return _msg(lang,
+                en=head + "\nYouTube did not return the " + which + " this time, so I am not "
+                     "going to invent a number. Ask again in a few minutes.",
+                hi=head + "\nYouTube ने इस बार " + which + " नहीं दिए, इसलिए मैं कोई आंकड़ा "
+                     "नहीं बनाऊँगा। कुछ मिनट बाद दोबारा पूछिए।",
+                hinglish=head + "\nYouTube ne is baar " + which + " nahi diye, isliye main "
+                          "bina data ke koi number nahi banaunga. Thodi der baad dobara pucho.")
+
+
+async def _facts_fix(chat_id, ans: str, facts: str, lang: str,
+                     image=None, audio=None, doc=None) -> str:
+    """One strict repair from the facts only, else the honest fallback. Never loops."""
+    log.info("facts guard: the reply invented something the fetch did not return")
+    out = ""
+    try:
+        out = await ask_gemini(
+            chat_id,
+            "Answer ONLY from the facts below. If a field says missing, say in one short "
+            "sentence that YouTube did not return it - do NOT give any number for it, do "
+            "not list comments that are not in the facts, and do not invent a title.\n\n"
+            + (facts or "")[:2500] + "\n\nQuestion: what are the views and comments?",
+            "", image, audio, doc, effort="fast")
+    except Exception as e:  # noqa: BLE001
+        log.debug("facts repair failed: %s", str(e)[:90])
+    out = (out or "").strip()
+    if out and _facts_reply_ok(out, facts):
+        log.info("facts guard: repair accepted")
+        return out
+    return _facts_fallback(facts, lang)
+
+
 def _yt_caption_host_ok(url: str) -> bool:
     """Is this a YouTube caption URL we are willing to fetch? Pure."""
     host = (urllib.parse.urlparse(url or "").hostname or "").lower()
@@ -8644,6 +8734,13 @@ async def _social_context(url: str, chat_id: int = 0) -> str:
             out = _SOCIAL_PARSERS[kind](js)
         if out:
             log.info("social post read (%s): %s chars", kind, len(out))
+            # If the source carried no engagement numbers, say so INSIDE the facts. Without
+            # this, a model asked "how many likes" invents them - the same failure as the
+            # invented view count on YouTube.
+            if not re.search(r"\d[\d,.]*\s*(?:k|m|likes?|views?|comments?|reposts?)",
+                             out, re.I):
+                out += ("\nengagement: not available in this source - do NOT guess views, "
+                        "likes, reposts or comment counts")
         return out
     except Exception as e:  # noqa: BLE001
         log.debug("social read failed (%s): %s", kind, str(e)[:100])
