@@ -108,7 +108,7 @@ from google import genai
 from google.genai import types
 
 # The prompt is CORE + packs (see packs.py) instead of one giant string.
-from packs import CORE, build_prompt, prompt_tokens_approx
+from packs import CORE, build_prompt, pick_packs, prompt_tokens_approx
 
 # Optional: load a local .env so `cp .env.example .env` actually works for local dev.
 # Python does NOT read .env by itself - without this, a fresh local setup silently had no
@@ -2111,6 +2111,97 @@ async def ask_pollinations(system: str, messages: list) -> str:
 
 
 # Avenor can decide BY ITSELF, from the message alone, to attach a file, send a voice note,
+# --- memory without a command ------------------------------------------------------
+# Reading your own memory used to need /memory. Nothing about it needs a slash, so a
+# plain question works too. It stays private-chat-only and read-only: erasure is still
+# an explicit /forget, because a sentence in a group must never delete someone's data.
+_MEMORY_Q_RE = re.compile(
+    r"(?:kya\s+yaad\s+hai|tumhe\s+(?:mere|mera)\s+baare\s+me\s+kya|"
+    r"mere\s+baare\s+me\s+kya\s+(?:yaad|pata|jaante|jaanta)|meri\s+memory|"
+    r"memory\s+me\s+kya|what\s+do\s+you\s+(?:remember|know)\s+about\s+me|"
+    r"\bmy\s+memory\b)", re.I)
+
+
+def _memory_view_text(uid: int) -> str:
+    """What is stored about ONE person. Used by /memory and by the plain-language path."""
+    if MEM is None:
+        return "Long-term memory is not available right now."
+    lines = [MEM.user_basic(uid) or "I don't have anything saved about you yet."]
+    prof = MEM.get_profile(uid).strip()
+    if prof:
+        lines.append("\n\U0001F9E0 What I remember about you:\n" + prof)
+    notes = MEM.raw_notes(uid)
+    if notes:
+        lines.append("\nNotes: " + "; ".join(notes[:15]))
+    lines.append("\n(/forget se ye sab delete ho jaata hai.)")
+    return "\n".join(lines)
+
+
+# --- humour verifier ---------------------------------------------------------------
+# A prompt that says "be light, never lecture" is a request, not a guarantee. On a free
+# tier model it is ignored often enough that users see it every day: asked a joke, the
+# bot answered with a legal explanation. So the last word belongs to code, not the model:
+# if the reply to a joke looks like an explanation, it is repaired once, and if it still
+# does, a deterministic short line is sent instead. This is the "verify-actor split" that
+# production agents use - the model proposes, code disposes.
+_HUMOUR_LEAK_RE = re.compile(
+    r"\b(?:rules?|kanoon|law|legal|policy|section\s*\d+|act\b|restriction|permission|"
+    r"allowed|prohibited|banned?|technical|guideline|compliance|as\s+per|ke\s+hisaab\s+se|"
+    r"active\s+person|notice|regulation|clause)\b", re.I)
+
+
+def _humour_reply_ok(ans: str) -> bool:
+    """Deterministic check: does this reply to a joke actually read like a joke reply?
+
+    Pure. Short + no legal/technical vocabulary + no leftover tags. Deliberately strict:
+    a false positive costs one more model call, a false negative costs the user.
+    """
+    t = (ans or "").strip()
+    if not t:
+        return False
+    if len(t.split()) > 24 or t.count("\n") > 2:
+        return False
+    if _HUMOUR_LEAK_RE.search(t):
+        return False
+    if re.search(r"\[\s*(?:file|search|quote|image|remind)\s*:", t, re.I):
+        return False
+    return True
+
+
+_HUMOUR_FALLBACK = {
+    "hinglish": ["😂 sahi pakda", "😂 haan bhai, sahi baat", "😄 ekdum sahi"],
+    "hindi": ["😂 सही पकड़ा", "😂 हाँ, बात तो सही है"],
+    "english": ["😂 fair enough", "😂 can't argue with that"],
+}
+
+
+async def _humour_fix(chat_id, text: str, ans: str, lang: str,
+                      image=None, audio=None, doc=None) -> str:
+    """One bounded repair, then a deterministic fallback. Never loops."""
+    if _humour_reply_ok(ans):
+        return ans
+    log.info("humour guard: a reply to a joke read like an explanation - repairing once")
+    fix = ""
+    try:
+        fix = await ask_gemini(
+            chat_id,
+            "They made a joke. Reply to it in at most 10 words: laugh, or accept their "
+            "punchline. No facts, no rules, no explanation, no 'sahi point hai'. "
+            "Language: " + (lang or "hinglish") + ".\nTheir message: "
+            + (text or "")[:200],
+            "", image, audio, doc, effort="fast")
+    except Exception as e:  # noqa: BLE001
+        log.debug("humour repair call failed: %s", str(e)[:100])
+    fix = (fix or "").strip()
+    if fix and _humour_reply_ok(fix):
+        log.info("humour guard: repair accepted")
+        return fix
+    pool = _HUMOUR_FALLBACK.get((lang or "").lower()) or _HUMOUR_FALLBACK["hinglish"]
+    picked = pool[len(text or "") % len(pool)]
+    log.info("humour guard: using the deterministic fallback %r", picked)
+    return picked
+
+
 _FILE_BLOCK_RE = re.compile(
     r"\[\s*file\s*:\s*([^\]\n]{1,60}?)\s*\]\s*(.*?)\s*\[\s*/\s*file\s*\]", re.S | re.I)
 # The model often forgets the closing [/file]. When it does, everything after the opening tag
@@ -4634,15 +4725,7 @@ async def cmd_memory(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_owner(user):
         # A normal user sees ONLY their own memory - never anyone else's.
-        lines = [MEM.user_basic(user.id) or "I don't have anything saved about you yet."]
-        prof = MEM.get_profile(user.id).strip()
-        if prof:
-            lines.append("\n🧠 What I remember about you:\n" + prof)
-        notes = MEM.raw_notes(user.id)
-        if notes:
-            lines.append("\nNotes: " + "; ".join(notes[:15]))
-        lines.append("\n(/forget deletes all of it.)")
-        await _send_plain(c.bot, chat_id, "\n".join(lines))
+        await _send_plain(c.bot, chat_id, _memory_view_text(user.id))
         return
     users, chats = MEM.all_users(), MEM.all_chats()
     out = [f"🧠 Memory - {len(users)} users, {len(chats)} chats"]
@@ -5387,7 +5470,21 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         for _chunk in split_text(_idc):
             await _safe_send(u, c, md_to_html(_chunk), _chunk)
         return
+    # "kya yaad hai mujhe?" - same view as /memory, no command needed.
+    if text and MEM is not None and _MEMORY_Q_RE.search(text):
+        if u.effective_chat.type == "private":
+            _mv = _memory_view_text(u.effective_user.id)
+            log_line(chat_id, "Avenor", _mv, 0)
+            for _chunk in split_text(_mv):
+                await _safe_send(u, c, md_to_html(_chunk), _chunk)
+            return
+        _g = ("Memory personal hoti hai - mujhe DM karke puchho, wahan bata dunga.")
+        await _safe_send(u, c, md_to_html(_g), _g)
+        return
+
     is_private = u.effective_chat.type == "private"
+    # Humour is decided ONCE, in code, and then enforced below - not hoped for in a prompt.
+    _humour = "humour" in pick_packs(text or "")
     _first_media = (media[0] if isinstance(media, list) and media else media)
     was_audio = bool(isinstance(_first_media, dict)
                      and _first_media.get("kind") == "audio")
@@ -5600,6 +5697,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     log.info("code-reference research for %r -> %s chars",
                              text[:50], len(_ref))
             if (RESEARCH_ENABLED and not media and text and len(text) > 4
+                    and not _humour          # a joke is never fact-checked
                     and _needs_live(text) and action_allowed(chat_id, "search")):
                 await _kick_typing(c.bot, chat_id)
                 pre_research = _untrusted(await free_web_search(text[:160], RESEARCH_RESULTS))
@@ -5616,11 +5714,13 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             ans = None
             if is_private and client is not None and ENABLE_STREAM:
                 ans = await ask_gemini_stream(chat_id, prompt, _guard(ctx),
-                                              c.bot, chat_id, msg, image, audio, doc)
+                                              c.bot, chat_id, msg, image, audio, doc,
+                                              effort="fast" if _humour else "")
                 if ans is not None:
                     reacted = True
             if ans is None:
-                ans = await ask_gemini(chat_id, prompt, _guard(ctx), image, audio, doc)
+                ans = await ask_gemini(chat_id, prompt, _guard(ctx), image, audio, doc,
+                                       effort="fast" if _humour else "")
 
             for _round in range(RESEARCH_MAX_ROUNDS):
                 m = _SEARCH_TAG_RE.search(ans or "")
@@ -5628,6 +5728,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     break
                 q = m.group(1).strip()
                 ans = _SEARCH_TAG_RE.sub("", ans or "")
+                if _humour:
+                    # The model asked for a lookup inside a joke turn: ignore it.
+                    log.info("humour turn - ignoring a [search:] request")
+                    break
                 if not (RESEARCH_ENABLED and q and action_allowed(chat_id, "search")):
                     break
                 await _kick_typing(c.bot, chat_id)
@@ -5724,6 +5828,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             ans = _SEARCH_TAG_RE.sub("", ans or "")      # never leak a tag to the user
             ans = _CALC_RE.sub("", ans or "")
             _t3 = time.monotonic()
+
+            # ---- HUMOUR VERIFIER -------------------------------------------------
+            # Code has the last word on a joke turn (see _humour_reply_ok).
+            if _humour and ans and "[file:" not in (ans or "").lower():
+                ans = await _humour_fix(chat_id, text, ans, lang, image, audio, doc)
 
             # ---- AUTONOMOUS FILE / VOICE / IMAGE --------------------------------
             # A reply may carry up to MAX_FILES_PER_REPLY blocks: a website is usually
