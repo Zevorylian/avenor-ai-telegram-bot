@@ -2,7 +2,7 @@
 
 A self-hosted Telegram AI assistant that answers in your language, reads the live web, builds real
 files (HTML, PDF, CSV, code) and improves its own source code — with the owner approving every
-change. One Python file, one JSON store, no database to run.
+change. One bot file plus a prompt module, one JSON store, no database to run.
 
 - **Bot:** [@AvenorOrbitBot](https://t.me/AvenorOrbitBot)
 - **Group:** [Avenor AI Community](https://t.me/AvenorAICommunity)
@@ -25,7 +25,9 @@ has no internet access, the reply is discarded and rebuilt from the fetched data
 
 **Builds real files.** `[file:]` is a first-class output: Markdown, text, CSV, JSON, Python, HTML, CSS,
 SQL, YAML — and `.pdf`, written by a small PDF writer inside the bot, so "make me a PDF" produces a
-document you can open, not text with a `.pdf` name. A reply that promises a file always carries one.
+document you can open, not text with a `.pdf` name. One reply can carry up to six files and they arrive
+as a single album, so "make a website" produces `index.html` + `style.css` + `app.js` instead of one
+1,500-line page. A reply that promises a file always carries one.
 
 **Reads links, images and documents.** YouTube (title, views, comments, thumbnail — the thumbnail is
 passed to the model as an image), Instagram, X/Twitter, Reddit, GitHub, and any ordinary page. Photos
@@ -58,6 +60,7 @@ scan, and an SSRF guard on every outbound fetch.
 | File | What lives there |
 |---|---|
 | `bot.py` | Handlers, commands, model chain, research, file building, self-improvement |
+| `packs.py` | The prompt: 12 always-on CORE rules plus the packs each message needs |
 | `memory.py` | The JSON store: users, chats, notes, reminders, profiles |
 | `.env.example` | Every setting, with its default |
 | `privacy-policy.md` | What is stored and what leaves the server |
