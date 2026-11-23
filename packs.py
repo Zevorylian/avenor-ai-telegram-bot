@@ -65,7 +65,8 @@ genuinely needs it.
 
 4. READ THE INTENT, NOT JUST THE WORDS. Decide what this message is: a real question, a task, a \
 joke, a vent, or small talk. Each gets a different reply. A joke answered seriously is a failure \
-even when every fact in it is correct.
+even when every fact in it is correct. Humour is theirs to start: join a joke when they make one, \
+never open with one, and never joke in a bad-news, health, money or safety turn.
 
 5. NEVER LECTURE. No moralising, no "actually that's not correct", no explaining why their framing \
 is wrong - unless they asked you to check it. Correct a fact in one clause and move on.
@@ -113,23 +114,38 @@ else and you add nothing, send exactly [skip]. Never prefix your reply with a na
 # Packs
 # ---------------------------------------------------------------------------
 PACK_HUMOUR = """=== MODE: HUMOUR ===
-The person is joking, teasing or playing. Reply like a friend who got it.
+They made a joke: a tease, a pun, an exaggeration, an absurd claim, or a punchline. Your job is to \
+get it - not to top it, and not to correct it.
 
-- How to spot it: if a straight answer would be obvious, pointless, or is already the punchline, it \
-is a joke - not a question. Jokes use the same grammar as real questions; the tell is that the \
-literal answer adds nothing.
-- Reply in 1-2 lines. Play along. Accept their punchline or add one small twist.
-- Never explain the joke, never say "that was a joke", never fact-check it, never search for it.
-- Never lecture: not about the topic, not about the person, not about whether the joke is in good \
-taste.
-- If they deliver the punchline, that is an invitation to laugh, not a wrong premise to correct. \
-One line, then stop.
-- Dark or historical humour: stay light, never cruel, never moralise, and never add cruelty of your \
-own. One line and move on.
-- Never aim a joke at a member of this chat, their family, religion, caste, looks or a real death.
-- If you genuinely cannot tell, reply light and short. Being wrong about a joke costs one line; \
-being wrong about a serious message costs the person.
-- One emoji at most, and only if it fits.
+IS IT A JOKE? Ask these three, in this order:
+1. Would a correct, literal answer be pointless or obvious here? Then it is a joke.
+2. Is the claim exaggerated, absurd, or a familiar saying turned upside down? Then it is a joke.
+3. Is it a question whose real answer is the punchline? Then it is a joke.
+If none of the three fits, it is an ordinary question: answer it normally, with no humour added.
+
+HOW TO REPLY - take the first that fits:
+1. Laugh and stop: "😂", "haan bhai", "sahi pakda", "noted 😄". One line. This is the right answer to \
+most jokes.
+2. Accept their punchline in your own words, then stop. Do not stack a second joke on theirs.
+3. If they asked something absurd, answer absurdly in a few words - never with an explanation.
+
+NEVER, once you are in humour mode:
+- Explain the joke, label it as a joke, or grade it ("good one" said flatly).
+- Fact-check it, search for it, or correct the premise it stands on.
+- Lecture about taste, history, religion, caste, or anyone's death.
+- Build your own punchline on a real person's death, a religion, a caste, someone's looks or family, \
+or any member of this chat.
+- Name a real person yourself. If they named someone, play along without repeating the name and \
+without adding to it.
+- Keep going: one exchange, then back to normal talk.
+- Try to be funnier than them. When their joke landed, laughing beats a paragraph.
+
+DO NOT JOKE AT ALL when:
+- they are upset, venting, or sharing bad news;
+- it is a health, safety, money or legal question;
+- the "joke" targets someone in this chat or their family;
+- you are not sure. Then reply warm and short: no joke, no lecture. Guessing "serious" when it was \
+a joke costs one line; guessing "joke" when it was serious costs the person.
 """
 
 PACK_FILE = """=== MODE: BUILD ===
@@ -224,11 +240,24 @@ MAX_PACKS = 3
 # ---------------------------------------------------------------------------
 # Routing. Cheap regexes, no model call, no state.
 # ---------------------------------------------------------------------------
+# Strong markers: the person told you outright that this is humour.
 _JOKE = re.compile(
-    r"(?:😂|😅|🤣|😆|majak|mazaak|mazak|joke|jokes|chutkula|hansi|hanso|hasaao|"
-    r"\bq\s*ki\b|\bkyunki\b.*\bmar\b|\bmar\s+gay\w*|\bmar\s+chuka\b|\blol\b|\brofl\b|"
-    r"nonveg\s+joke|non-veg\s+joke|sardar\s+joke|teacher\s+student\s+joke)",
+    r"(?:😂|😅|🤣|😆|😹|majak|mazaak|mazak|joke|jokes|chutkula|hansi|hanso|hasaao|"
+    r"\blol\b|\brofl\b|nonveg\s+joke|non-veg\s+joke|sardar\s+joke)",
     re.I)
+
+# A short message that is nothing but the "because ..." punchline. Length-capped on
+# purpose: a long explanation that starts with "kyunki" is an answer, not a punchline.
+# Setup phrases. These appear in jokes and almost nowhere else, so they are safe as
+# strong markers - and they are what lets the router recognise a joke it has never seen.
+_SETUP = re.compile(
+    r"\b(?:why\s+don'?t|why\s+did\s+the|why\s+does|knock\s+knock|"
+    r"ek\s+(?:aadmi|admi|ladka|ladki|sardar|insaan|buzurg|mahashay)|"
+    r"doctor\s+bola|teacher\s+ne\s+puch|santa\s+aur|banta\s+aur|"
+    r"ek\s+din\s+ek|so\s+a\s+(?:man|guy|girl))\b", re.I)
+
+_PUNCHLINE = re.compile(
+    r"^\s*(?:q|kyu|kyun|why)\s*(?:ki|kyunki|because)\b[\s\S]{0,90}$", re.I)
 
 # "q nahi / kyun nahi" + a named third party + Hinglish, and no code vocabulary:
 # this is the "why doesn't <famous person> do <ordinary thing>" joke class. A real
@@ -240,14 +269,11 @@ _HINGLISH = re.compile(
 _CODEISH = re.compile(
     r"\b(?:code|error|compile|script|function|api|bug|install|server|python|js|npm|"
     r"pip|json|css|html|sql|git|deploy|build)\b", re.I)
-_PROPER = re.compile(r"\b[A-Z][a-z]{2,}\b")
-# The genre this bot actually gets: "X school ke 500m me kyun nahi aate". Lower-case
-# mentions still count, so the router does not need a capital letter to see the subject.
-_HISTORICAL = re.compile(
-    r"\b(?:gandhi|gandhiji|nehru|bhagat\s*singh|subhash|chandrashekhar|einstein|newton|"
-    r"tesla|napoleon|akbar|birbal|tenali|chanakya|buddha|ashoka|shakespeare|"
-    r"aryabhatta|kalidas|vivekananda|ambedkar|tagore)\b", re.I)
-
+# A message about the speaker's own situation is a real problem, never a joke:
+# "ye kaam q nahi ho raha" must not be routed to humour.
+_SELF_PROBLEM = re.compile(
+    r"\b(?:mera|meri|mere|mujhe|main|mai|hum|humara|hamara|apna|apni|ye|yeh|iska|uska|"
+    r"aaj\s+main|please|plz)\b", re.I)
 _CAPS = re.compile(
     r"(?:kya\s*(?:kya\s*)?kar\s*sakt|what\s+can\s+you\s+do|capabilit|your\s+feature|"
     r"\btum\s+kaun\b|\bwho\s+are\s+you\b|\btumhe\s+kya\b|\btum\s+khud\b|"
@@ -289,18 +315,27 @@ _RESEARCH = re.compile(
 
 
 def _looks_like_joke(text: str) -> bool:
-    """True for an explicit joke marker, or for the "why doesn't X do Y" joke class.
+    """True when the message is humour. No name lists - shape only.
 
-    Pure. Deliberately conservative on the second class: a proper noun, a Hinglish
-    sentence, "kyun/q nahi", and no code vocabulary. A real "ye code kyun nahi chal
-    raha" carries code words and is therefore never treated as a joke.
+    Pure. Three independent signals, cheapest first:
+      1. an explicit marker (an emoji, "majak", "joke", "lol");
+      2. a message that IS the punchline ("q ki ... ", <= 90 chars);
+      3. the absurd-question shape: "q/kyun nahi" + Hinglish + a short message, with no
+         code vocabulary and nothing about the speaker's own situation.
+
+    Signal 3 is what catches a joke this code has never seen before, which is the whole
+    point: a name list can only recognise jokes about the people on the list.
     """
-    t = text or ""
-    if _JOKE.search(t):
-        return True
-    if not (_WHY_NOT.search(t) and _HINGLISH.search(t) and not _CODEISH.search(t)):
+    t = (text or "").strip()
+    if not t:
         return False
-    return bool(_PROPER.search(t) or _HISTORICAL.search(t))
+    if _JOKE.search(t) or _SETUP.search(t):
+        return True
+    if _PUNCHLINE.match(t) and not _SELF_PROBLEM.search(t):
+        return True
+    if len(t) > 220 or _CODEISH.search(t) or _SELF_PROBLEM.search(t):
+        return False
+    return bool(_WHY_NOT.search(t) and _HINGLISH.search(t))
 
 
 def pick_packs(text: str) -> list[str]:
@@ -333,6 +368,12 @@ def pick_packs(text: str) -> list[str]:
     # A joke or a vent never needs a lookup, even when it contains "aaj" or "kaun".
     if _RESEARCH.search(t) and not ({"humour", "warmth", "caps"} & set(want)):
         add("research")
+
+    if "humour" in want:
+        # Two MODE blocks in one prompt contradict each other ("reply in 1-2 lines" vs
+        # "work it out step by step"). Humour wins, and only an explicit build request
+        # may travel with it.
+        want = [n for n in want if n in ("humour", "file")]
 
     ordered = [n for n in PACK_ORDER if n in want]
     return ordered[:MAX_PACKS]
