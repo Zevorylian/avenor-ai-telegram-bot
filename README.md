@@ -36,11 +36,15 @@ as a single album, so "make a website" produces `index.html` + `style.css` + `ap
 1,500-line page. A reply that promises a file always carries one.
 
 **Sends real books, rebuilt as one clean PDF.** Ask in plain words — *"mujhe Frankenstein
-chahiye"* — and the bot searches Project Gutenberg (Gutendex, no key, 70k+ titles), then
-gutenberg.org's own search, then **archive.org** (its `_djvu.txt` OCR text). It downloads the
-source **in memory only**, takes the text out (EPUB → XHTML → text, or TXT/HTML), throws the
-download away, and writes **one new PDF** with its own writer. Nothing is ever saved to disk, so
-there is no temp file to clean up. No command, no keyword: the intent comes from the message.
+chahiye"* — and the bot searches Project Gutenberg (Gutendex, no key, 70k+ titles, filtered to
+`copyright=false`), then gutenberg.org's own search. It downloads the source **in memory only**,
+takes the text out (EPUB → XHTML → text, or TXT/HTML), throws the download away, and writes **one
+new PDF** with its own writer. Nothing is ever saved to disk, so there is no temp file to clean up.
+No command, no keyword: the intent comes from the message.
+
+archive.org was removed on purpose: it hosts user uploads, and an in-copyright book (*Atomic
+Habits*) was served from it as "public domain". Only sources that are public domain by
+construction are used now.
 
 The model is explicitly told **not** to write the book itself — a fabricated book is worse than
 no book. If the text is Devanagari/Tamil/Bengali the PDF writer cannot draw it (Latin-1 only), so

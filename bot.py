@@ -236,6 +236,9 @@ FILE_FULL_REPAIR_COUNT = max(1, int(os.environ.get("FILE_FULL_REPAIR_COUNT", "1"
 # A file shorter than this is a stub. It is never sent as-is: it is either repaired
 # (full pipeline) or counted as empty. 40 chars of code or prose is still nothing.
 MIN_FILE_BODY = max(10, int(os.environ.get("MIN_FILE_BODY", "40") or "40"))
+# A file under this, after its repair pass, is a stub and is never sent. A 90-byte
+# "document.md" reached a user once; it will not happen again.
+STUB_FILE_BODY = max(40, int(os.environ.get("STUB_FILE_BODY", "200") or "200"))
 # Files 2..N skip the three model calls, but a THIN file still gets the fatten pass -
 # that is the difference between "index.pdf 1.3 KB" and a real page.
 THIN_FILE_BODY = max(100, int(os.environ.get("THIN_FILE_BODY", "300") or "300"))
@@ -2227,11 +2230,7 @@ async def _book_search(query: str, lang: str = "") -> list:
     if rows:
         return rows
     log.info("gutendex empty for %r - trying gutenberg.org search", query[:40])
-    rows = await _gutenberg_html(query)
-    if rows:
-        return rows
-    log.info("gutenberg.org empty for %r - trying archive.org", query[:40])
-    return await _archive_search(query)
+    return await _gutenberg_html(query)
 
 
 async def _gutendex(query: str, lang: str = "") -> list:
@@ -2241,7 +2240,9 @@ async def _gutendex(query: str, lang: str = "") -> list:
     hit = _BOOK_CACHE.get(query.lower())
     if hit and (time.time() - hit[0]) < _BOOK_TTL:
         return hit[1]
-    params = {"search": query}
+    # copyright=false is not decoration: it is the difference between a public-domain
+    # classic and an unauthorised upload of a book that is still in copyright.
+    params = {"search": query, "copyright": "false"}
     if lang:
         params["languages"] = lang
     try:
@@ -2329,73 +2330,6 @@ def _latin_ok(text: str) -> bool:
     return (ok / len(sample)) > 0.98
 
 
-async def _archive_search(query: str) -> list:
-    """Public-domain texts on archive.org. Keyless, and it has its own catalogue API."""
-    if not query:
-        return []
-    try:
-        r = await HTTP.get("https://archive.org/advancedsearch.php", params={
-            "q": f"title:({query}) AND mediatype:texts",
-            "fl[]": ["identifier", "title", "creator"], "rows": "4", "output": "json",
-        }, timeout=18, headers={"User-Agent": _UA_WEB, "Accept": "application/json"})
-        if r.status_code != 200:
-            return []
-        docs = (((r.json() or {}).get("response") or {}).get("docs")) or []
-    except Exception as e:  # noqa: BLE001
-        log.info("archive.org search failed for %r: %s", query[:40], str(e)[:90])
-        return []
-    out = []
-    for d in docs:
-        if not isinstance(d, dict) or not d.get("identifier"):
-            continue
-        out.append({
-            "archive_id": d["identifier"],
-            "title": (d.get("title") or "").strip() if isinstance(d.get("title"), str)
-                     else " ".join(d.get("title") or [])[:160],
-            "authors": (d.get("creator") if isinstance(d.get("creator"), str)
-                        else ", ".join(d.get("creator") or []))[:120],
-            "formats": {},
-            "downloads": 0,
-        })
-    return out
-
-
-async def _archive_text(identifier: str) -> str:
-    """The OCR text of an archive.org item (the `_djvu.txt` file every scanned text has)."""
-    try:
-        m = await HTTP.get(f"https://archive.org/metadata/{identifier}", timeout=18,
-                           headers={"User-Agent": _UA_WEB, "Accept": "application/json"})
-        if m.status_code != 200:
-            return ""
-        files = (m.json() or {}).get("files") or []
-    except Exception as e:  # noqa: BLE001
-        log.info("archive metadata failed for %s: %s", identifier, str(e)[:80])
-        return ""
-    pick = None
-    for f in files:
-        name = (f.get("name") or "")
-        if name.endswith("_djvu.txt"):
-            pick = name
-            break
-    if not pick:
-        for f in files:
-            name = (f.get("name") or "")
-            if name.lower().endswith(".txt") and "meta" not in name.lower():
-                pick = name
-                break
-    if not pick:
-        return ""
-    try:
-        r = await HTTP.get(f"https://archive.org/download/{identifier}/{pick}", timeout=40,
-                           headers={"User-Agent": _UA_WEB})
-        if r.status_code != 200:
-            return ""
-        return (r.text or "")[:BOOK_TEXT_LIMIT * 2]
-    except Exception as e:  # noqa: BLE001
-        log.info("archive text download failed for %s: %s", identifier, str(e)[:80])
-        return ""
-
-
 def _book_author(book: dict) -> str:
     """The author as plain text, whatever shape the catalogue used. Pure."""
     a = (book or {}).get("authors")
@@ -2447,19 +2381,6 @@ async def _book_download(book: dict, want_pdf: bool = False) -> tuple:
                     book["title"] = re.sub(r"\s*\|.*$", "", html.unescape(mt.group(1))).strip()
         except Exception as e:  # noqa: BLE001
             log.debug("book page title failed: %s", str(e)[:70])
-    # archive.org has no "formats" map: its text is the OCR file, fetched separately.
-    if book.get("archive_id") and not book.get("formats"):
-        text = await _archive_text(book["archive_id"])
-        if not text.strip():
-            return "", b"", "archive.org item has no text file"
-        text = _strip_gutenberg(text)
-        title = re.sub(r"[^\w\- ]+", "", book.get("title") or "book")[:60].strip() or "book"
-        author = re.sub(r"[^\w\- ]+", "", _book_author(book).split(",")[0])[:30].strip()
-        base = (title + (" - " + author if author else "")).strip()
-        if _latin_ok(text):
-            return f"{base}.pdf", _text_to_pdf(text[:BOOK_TEXT_LIMIT], base + ".pdf"), ""
-        return f"{base}.txt", text[:BOOK_TEXT_LIMIT].encode("utf-8"), ""
-
     url, ext = _book_pick_file(book, want_pdf)
     if not url:
         return "", b"", "no downloadable format"
@@ -6620,13 +6541,18 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                 log.info("book %r not downloadable: %s",
                                          _bk.get("title", "")[:40], _why)
                                 continue
-                            _src = ("archive.org" if _bk.get("archive_id")
-                                    else "Project Gutenberg")
+                            _src = "Project Gutenberg"
+                            # The caption says what was SENT, not what was hoped for: a
+                            # "PDF" caption on a .txt file was one of the visible bugs.
+                            _fmt = (_fname.rsplit(".", 1)[-1].upper() if "." in _fname
+                                    else "FILE")
+                            _why_fmt = ("text se banaya gaya PDF" if _fmt == "PDF" else
+                                        "TXT - PDF writer Devanagari/regional script nahi "
+                                        "likh sakta, isliye padhne layak file bheji")
                             _cap = ("📚 " + (_bk.get("title") or "Book")[:120] +
                                     ((" — " + (_bk.get("authors") or "")) if _bk.get("authors")
                                      else "") +
-                                    "\n" + _src + " · public domain · text se banaya gaya "
-                                    "PDF (koi temp file save nahi hoti)")
+                                    "\n" + _src + " · public domain · " + _why_fmt)
                             if await _send_book(c.bot, chat_id, _fname, _fdata, _cap):
                                 ans = _msg(lang,
                                            en=("Here it is: " + _fname + ". Public domain, "
@@ -6681,6 +6607,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             file_note = ""
             filed_name = ""
             dropped_files = 0
+            _stub_files = 0
             file_blocked = False
             # Rename to .pdf ONLY when pdf was the single format asked for.
             _want_pdf = _pdf_only_request(text or "")
@@ -6717,6 +6644,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         if _problem:
                             log.info("file %s failed the syntax gate: %s", _fname, _problem)
                             file_note = file_note or _problem
+                    if len((_body or "").strip()) < STUB_FILE_BODY:
+                        # After the repair pass it is still a stub (a 90-byte "document.md"
+                        # is not a deliverable). It is dropped and reported, not shipped.
+                        log.info("dropped a stub file %s (%s chars)", _fname, len(_body or ""))
+                        _stub_files += 1
+                        continue
                     _ready.append((_fname, _body))
                 _sent_names = await send_made_files(c.bot, chat_id, _ready)
                 if _sent_names:
@@ -6735,11 +6668,68 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         _cap = _strip_attachment_claims(ans) if ans else ""
                         ans = ("Ye " + str(len(_sent_names)) + " files: " + _names
                                + ("\n\n" + _cap if _cap else "")).strip()
-                else:
+                elif _ready:
+                    # We were allowed to send and the send itself failed.
                     file_blocked = True
+                else:
+                    # Every block was a stub: say so plainly instead of showing the
+                    # "file limit reached" message, which would be a lie.
+                    ans = _msg(lang,
+                               en="I could not write that properly - the files came out "
+                                  "empty. Ask me again and I will build them fully.",
+                               hi="वो ठीक से नहीं बन पाया - फ़ाइलें खाली निकलीं। दोबारा "
+                                  "बोलिए, पूरा बना दूँगा।",
+                               hinglish="Wo theek se nahi ban paya - files khaali nikli. "
+                                        "Dobara bolo, poora bana dunga.")
                 if _overflow:
                     ans = (ans + "\n\n" + str(_overflow) + " file aur thi - bolo to next "
                            "message me bhej doon.").strip()
+                if _stub_files:
+                    ans = (ans + "\n\n" + str(_stub_files) + " file khaali thi, isliye nahi "
+                           "bheji - dobara bolo to theek se bana dunga.").strip()
+                # The person asked for specific formats; a model that writes two of three
+                # must be asked once for the rest instead of silently under-delivering.
+                _want_exts = _requested_exts(text or "")
+                if _want_exts and _sent_names:
+                    _got_exts = {(n.rsplit(".", 1)[-1].lower() if "." in n else "")
+                                 for n in _sent_names}
+                    _missing = sorted(e for e in (_want_exts - _got_exts) if e)
+                    if _missing:
+                        log.info("missing formats after delivery: %s - asking once",
+                                 _missing)
+                        try:
+                            _ask = ("The person asked for these file formats and they are "
+                                    "still missing: " + ", ".join("." + e for e in _missing[:3])
+                                    + ". Write ONLY those files now, each in its own "
+                                    "[file: name.ext] ... [/file] block with real content. "
+                                    "No commentary outside the blocks.")
+                            _fix = await ask_gemini(chat_id, _ask, "", None, None, None,
+                                                    effort="fast")
+                            _f2, _q2, _o2, _e2 = _collect_file_blocks(_fix or "", 3,
+                                                                      _pdf_only_request(text or ""))
+                            if _q2:
+                                _n2 = await send_made_files(c.bot, chat_id, _q2)
+                                if _n2:
+                                    _names2 = ", ".join("`" + _x + "`" for _x in _n2)
+                                    ans = (ans + "\n\n" + _msg(
+                                        lang,
+                                        en="Also added: " + _names2,
+                                        hi="ये भी जोड़ दी: " + _names2,
+                                        hinglish="Ye bhi add kar di: " + _names2)).strip()
+                        except Exception as e:  # noqa: BLE001
+                            log.info("missing-format repair failed: %s", str(e)[:90])
+            # A block so short it was dropped before delivery still has to be explained:
+            # silence looks like the bot ignored the request.
+            if _empty and not file_sent and not _queue:
+                _el = _msg(lang,
+                           en="I started a file but it came out empty, so I did not send "
+                              "it. Ask again and I will write it fully.",
+                           hi="फ़ाइल बनानी शुरू की थी पर खाली निकली, इसलिए नहीं भेजी। दोबारा "
+                              "बोलिए, पूरी बना दूँगा।",
+                           hinglish="File banani shuru ki thi par khaali nikli, isliye nahi "
+                                    "bheji. Dobara bolo, poori bana dunga.")
+                ans = ((ans or "").strip() + "\n\n" + _el).strip()
+
             # ---- NEVER PASTE A WHOLE DOCUMENT INTO THE CHAT ----------------------
             # The screenshot case: the model wrote the page inline, or the file action was
             # rate-limited, so the reply was the raw HTML. Turn it into a file if we still
