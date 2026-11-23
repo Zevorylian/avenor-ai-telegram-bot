@@ -232,6 +232,12 @@ MAX_FILES_PER_REPLY = max(1, min(10, int(os.environ.get("MAX_FILES_PER_REPLY", "
 # Files 2..N get a syntax gate only. Running validate + fatten + polish on every file
 # cost three model calls per file, which blew the free-tier quota on a 3-file project.
 FILE_FULL_REPAIR_COUNT = max(1, int(os.environ.get("FILE_FULL_REPAIR_COUNT", "1") or "1"))
+# A file shorter than this is a stub. It is never sent as-is: it is either repaired
+# (full pipeline) or counted as empty. 40 chars of code or prose is still nothing.
+MIN_FILE_BODY = max(10, int(os.environ.get("MIN_FILE_BODY", "40") or "40"))
+# Files 2..N skip the three model calls, but a THIN file still gets the fatten pass -
+# that is the difference between "index.pdf 1.3 KB" and a real page.
+THIN_FILE_BODY = max(100, int(os.environ.get("THIN_FILE_BODY", "300") or "300"))
 # ^ TOTAL cap for the transcript sent to the model each turn (40 x 400 was up to 16k
 #   chars of input on EVERY reply, which was a direct cause of slow answers).
 CALL_TIMEOUT = int(os.environ.get("CALL_TIMEOUT", "20") or "20")   # fail over faster
@@ -2137,6 +2143,16 @@ def _memory_view_text(uid: int) -> str:
     return "\n".join(lines)
 
 
+def _humour_mode(text: str) -> bool:
+    """True when this turn is a joke turn. Pure.
+
+    A message can be a joke AND a task ("majak chhod, 3 file banao"): the work wins,
+    because a joke reply to a build request is the bot doing nothing.
+    """
+    names = pick_packs(text or "")
+    return "humour" in names and "file" not in names
+
+
 # --- humour verifier ---------------------------------------------------------------
 # A prompt that says "be light, never lecture" is a request, not a guarantee. On a free
 # tier model it is ignored often enough that users see it every day: asked a joke, the
@@ -2156,6 +2172,13 @@ _HUMOUR_LEAK_RE = re.compile(
 _HUMOUR_PROMISE_RE = re.compile(
     r"\b(?:check|dekh|search|dhundo|verify|confirm|pata\s*kar)\w*\b[\s\S]{0,40}"
     r"\b(?:batata|batati|bataunga|bata\s*doonga|update\s*kar|bolta|batayenge)\w*", re.I)
+# Rating the joke is the thing people read as over-acting. Claude's own system prompt
+# bans opening with "good/great/fascinating", and the same rule applies here: answer the
+# joke, do not hand out marks.
+_HUMOUR_PRAISE_RE = re.compile(
+    r"^[\s\W_]{0,6}(?:sahi|sach(?:chi)?|bilkul|ekdum|nice|good|great|wah|waah|"
+    r"kya\s*baat|shabaash|shabash|well\s*(?:said|played)|good\s*one|"
+    r"solid|mast|zabardast|badiya|badhiya)\b", re.I)
 _HUMOUR_CLAIM_RE = re.compile(
     r"\b(?:kehte\s+the|kehta\s+tha|kaha\s+tha|kahi\s+thi|likha\s+tha|"
     r"used\s+to\s+say|said\s+that|believed\s+that|once\s+said)\b", re.I)
@@ -2174,31 +2197,74 @@ def _humour_reply_ok(ans: str) -> bool:
         return False
     if _HUMOUR_LEAK_RE.search(t) or _HUMOUR_PROMISE_RE.search(t) or _HUMOUR_CLAIM_RE.search(t):
         return False
+    if _HUMOUR_PRAISE_RE.search(t):
+        return False
     if re.search(r"\[\s*(?:file|search|quote|image|remind)\s*:", t, re.I):
         return False
     return True
 
 
+# No grading, no invented punchline: an emoji or a plain agreement is what a person
+# actually sends. Kept short on purpose.
 _HUMOUR_FALLBACK = {
-    "hinglish": ["😂 sahi pakda", "😂 haan bhai, sahi baat", "😄 ekdum sahi"],
-    "hindi": ["😂 सही पकड़ा", "😂 हाँ, बात तो सही है"],
-    "english": ["😂 fair enough", "😂 can't argue with that"],
+    "hinglish": ["😄", "😅", "haan 😄", "😄 wahi to", "hmm 😄"],
+    "hindi": ["😄", "😅", "हाँ 😄", "😄 वही तो"],
+    "english": ["😄", "😅", "ha, fair", "hmm 😄"],
 }
+# After two playful replies in a row, a joke turn gets no laugh at all - people do not
+# want a comedian in every message.
+_HUMOUR_NEUTRAL = {
+    "hinglish": ["hmm", "acha", "samajh gaya"],
+    "hindi": ["हम्म", "अच्छा"],
+    "english": ["hmm", "okay"],
+}
+_HUMOUR_STREAK: dict = {}
+# The same laugh line twice in a row is what "over-acting" looks like in a chat. Both the
+# repeated joke and the repeated line are tracked per chat.
+_HUMOUR_REPEAT = {
+    "hinglish": "😄 ab bas, ye sun chuka hoon",
+    "hindi": "😄 अब बस, ये सुन चुका हूँ",
+    "english": "😄 alright, heard that one",
+}
+_LAST_LAUGH: dict = {}
+_LAST_JOKE: dict = {}
+_JOKE_REQUEST_RE = re.compile(
+    r"\b(?:majak|mazaak|mazak|joke|chutkula)\b[\s\S]{0,20}\b(?:sunao|bolo|batao|tell|suna)\b",
+    re.I)
 
 
 async def _humour_fix(chat_id, text: str, ans: str, lang: str,
                       image=None, audio=None, doc=None) -> str:
     """One bounded repair, then a deterministic fallback. Never loops."""
+    _lang = (lang or "").lower()
+    if _HUMOUR_STREAK.get(chat_id, 0) >= 2:
+        # Third playful turn in a row: stop performing. This is the difference between
+        # a friend and a clown.
+        _HUMOUR_STREAK[chat_id] = 0
+        _plain = _HUMOUR_NEUTRAL.get(_lang) or _HUMOUR_NEUTRAL["hinglish"]
+        log.info("humour guard: two laughs in a row already - going plain")
+        return _plain[len(text or "") % len(_plain)]
     if _humour_reply_ok(ans):
+        _LAST_JOKE[chat_id] = (text or "").strip().lower()
+        _HUMOUR_STREAK[chat_id] = _HUMOUR_STREAK.get(chat_id, 0) + 1
         return ans
+    _key = (text or "").strip().lower()
+    if _key and _LAST_JOKE.get(chat_id) == _key and not _JOKE_REQUEST_RE.search(_key):
+        # They told the same joke again. Laughing the same way again is over-acting.
+        log.info("humour guard: repeated joke for chat %s - not laughing twice", chat_id)
+        _HUMOUR_STREAK[chat_id] = 0
+        return _HUMOUR_REPEAT.get(_lang) or _HUMOUR_REPEAT["hinglish"]
+    if _key:
+        _LAST_JOKE[chat_id] = _key
     log.info("humour guard: a reply to a joke read like an explanation - repairing once")
     fix = ""
     try:
         fix = await ask_gemini(
             chat_id,
-            "They made a joke. Reply to it in at most 10 words: laugh, or accept their "
-            "punchline. No facts, no rules, no explanation, no 'sahi point hai'. "
-            "Language: " + (lang or "hinglish") + ".\nTheir message: "
+            "They made a joke. Reply in one line of at most 12 words, the way a person "
+            "would: either complete their logic, or accept the punchline. Do not grade it "
+            "(no 'sahi pakda', no 'good one'), no facts, no explanation, no emoji unless "
+            "they used one. Language: " + (lang or "hinglish") + ".\nTheir message: "
             + (text or "")[:200],
             "", image, audio, doc, effort="fast")
     except Exception as e:  # noqa: BLE001
@@ -2206,11 +2272,18 @@ async def _humour_fix(chat_id, text: str, ans: str, lang: str,
     fix = (fix or "").strip()
     if fix and _humour_reply_ok(fix):
         log.info("humour guard: repair accepted")
+        _HUMOUR_STREAK[chat_id] = _HUMOUR_STREAK.get(chat_id, 0) + 1
         return fix
-    pool = _HUMOUR_FALLBACK.get((lang or "").lower()) or _HUMOUR_FALLBACK["hinglish"]
-    picked = pool[len(text or "") % len(pool)]
-    log.info("humour guard: using the deterministic fallback %r", picked)
-    return picked
+    _HUMOUR_STREAK[chat_id] = _HUMOUR_STREAK.get(chat_id, 0) + 1
+    pool = _HUMOUR_FALLBACK.get(_lang) or _HUMOUR_FALLBACK["hinglish"]
+    start = (len(text or "") + int(chat_id or 0)) % len(pool)
+    for _k in range(len(pool)):
+        picked = pool[(start + _k) % len(pool)]
+        if picked != _LAST_LAUGH.get(chat_id):
+            _LAST_LAUGH[chat_id] = picked
+            log.info("humour guard: using the deterministic fallback %r", picked)
+            return picked
+    return pool[0]
 
 
 # --- promise guard ------------------------------------------------------------------
@@ -2272,6 +2345,43 @@ _FILE_BLOCK_RE = re.compile(
 _FILE_OPEN_RE = re.compile(r"\[\s*file\s*:\s*([^\]\n]{1,60}?)\s*\]", re.I)
 
 
+_REQ_EXT_RE = re.compile(
+    r"\.(html?|md|markdown|pdf|docx?|csv|json|py|js|ts|css|sql|ya?ml|txt|xml)\b"
+    r"|\b(html|md|markdown|pdf|docx?|csv|json|python|javascript|typescript|css|sql|text)\b", re.I)
+_EXT_ALIAS = {"htm": "html", "markdown": "md", "python": "py", "javascript": "js",
+              "typescript": "ts", "text": "txt", "doc": "docx", "yml": "yaml"}
+
+
+def _requested_exts(text: str) -> set:
+    """Every file format the person actually named. Pure."""
+    out = set()
+    for m in _REQ_EXT_RE.finditer(text or ""):
+        e = (m.group(1) or m.group(2) or "").lower()
+        out.add(_EXT_ALIAS.get(e, e))
+    return out
+
+
+def _pdf_only_request(text: str) -> bool:
+    """True only when PDF is the ONLY format they asked for.
+
+    "1. html 2. md 3. pdf - 3 file banao" used to rename ALL THREE to .pdf, so the
+    person asked for an HTML page and got index.pdf. A rename is only ever correct
+    when pdf is the single format requested.
+    """
+    return _requested_exts(text) == {"pdf"}
+
+
+def _dedupe_name(name: str, used: set) -> str:
+    """Two files called document.pdf in one album are indistinguishable. Pure."""
+    base, dot, ext = (name.rpartition(".") if "." in name else (name, "", ""))
+    cand, n = name, 2
+    while cand.lower() in used:
+        cand = f"{base}-{n}{dot}{ext}"
+        n += 1
+    used.add(cand.lower())
+    return cand
+
+
 def _collect_file_blocks(ans: str, limit: int = 6,
                          want_pdf: bool = False) -> tuple:
     """Pull every [file: name] ... [/file] block out of a reply. Pure.
@@ -2290,17 +2400,18 @@ def _collect_file_blocks(ans: str, limit: int = 6,
     overflow = max(0, len(blocks) - max(1, limit))
     for fm in blocks:
         clean = clean.replace(fm.group(0), "").strip()
+    used: set = set()
     for fm in blocks[:max(1, limit)]:
         fname = fm.group(1).strip()
         fbody = fm.group(2)
-        if not fbody.strip():
+        if len(fbody.strip()) < MIN_FILE_BODY:
+            # A 20-character "file" is a stub, not a deliverable. Counting it as empty
+            # is honest; sending it makes the bot look like it did nothing.
             empty += 1
             continue
         if want_pdf and not fname.lower().endswith(".pdf"):
-            # They asked for a PDF and the model named it .md: delivery must match
-            # the request, so the extension is corrected here.
             fname = (fname.rsplit(".", 1)[0] if "." in fname else fname) + ".pdf"
-        out.append((safe_filename(fname), fbody))
+        out.append((_dedupe_name(safe_filename(fname), used), fbody))
     return clean, out, overflow, empty
 
 
@@ -5546,7 +5657,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
 
     is_private = u.effective_chat.type == "private"
     # Humour is decided ONCE, in code, and then enforced below - not hoped for in a prompt.
-    _humour = "humour" in pick_packs(text or "")
+    _humour = _humour_mode(text or "")
     _first_media = (media[0] if isinstance(media, list) and media else media)
     was_audio = bool(isinstance(_first_media, dict)
                      and _first_media.get("kind") == "audio")
@@ -5912,7 +6023,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             filed_name = ""
             dropped_files = 0
             file_blocked = False
-            _want_pdf = bool(re.search(r"(?i)\bpdf\b", text or ""))
+            # Rename to .pdf ONLY when pdf was the single format asked for.
+            _want_pdf = _pdf_only_request(text or "")
             ans, _queue, _overflow, _empty = _collect_file_blocks(
                 ans or "", MAX_FILES_PER_REPLY, _want_pdf)
             dropped_files += _empty
@@ -5932,7 +6044,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             if _queue:
                 _ready: list = []
                 for _i, (_fname, _fbody) in enumerate(_queue):
-                    if _i < FILE_FULL_REPAIR_COUNT:
+                    if _i < FILE_FULL_REPAIR_COUNT or len(_fbody.strip()) < THIN_FILE_BODY:
                         _body, _note = await _validate_and_repair(chat_id, _fname, _fbody)
                         _body, _thin = await _fatten_if_thin(chat_id, _fname, _body, text)
                         _body, _polish = await _polish_html(chat_id, _fname, _body, text)
@@ -5958,8 +6070,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     await _send_preview(c.bot, chat_id, _ready[0][0], _ready[0][1])
                     if len(_sent_names) > 1:
                         _names = ", ".join("`" + _n + "`" for _n in _sent_names)
+                        # The model also writes "Yeh lo tumhari teeno files ready hain" -
+                        # two lines saying the same thing is exactly the over-acting
+                        # people notice. The claim sentences go; the list stays.
+                        _cap = _strip_attachment_claims(ans) if ans else ""
                         ans = ("Ye " + str(len(_sent_names)) + " files: " + _names
-                               + ("\n\n" + ans if ans else "")).strip()
+                               + ("\n\n" + _cap if _cap else "")).strip()
                 else:
                     file_blocked = True
                 if _overflow:
