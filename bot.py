@@ -10442,6 +10442,56 @@ async def _discord_prepare_media(message):
     return None, None, (txt.encode("utf-8"), "text/plain"), "doc_loaded", ""
 
 
+def _voice_ready() -> dict:
+    """Which pieces of voice are present on this host. Pure (imports only, never raises).
+
+    Voice has four moving parts and each one fails differently, so /diag reports them
+    separately instead of one vague "voice: on".
+    """
+    out = {"nacl": False, "opus": False, "recv": False, "ffmpeg": bool(_ffmpeg_exe())}
+    try:
+        import nacl  # noqa: F401
+        _ = nacl  # presence check only
+        out["nacl"] = True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import discord as _d
+        try:
+            if not _d.opus.is_loaded():
+                _d.opus.load_opus("libopus.so.0")
+            out["opus"] = bool(_d.opus.is_loaded())
+        except Exception:  # noqa: BLE001
+            out["opus"] = False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from discord.ext import voice_recv  # noqa: F401
+        _ = voice_recv
+        out["recv"] = True
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+async def _pcm48_stereo_to_wav(pcm: bytes) -> bytes:
+    """Discord sends 48 kHz stereo s16le. Whisper wants a WAV: ffmpeg does the conversion."""
+    exe = _ffmpeg_exe()
+    if not exe or not pcm:
+        return b""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe, "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "48000",
+            "-ac", "2", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(pcm), timeout=20)
+        return out or b""
+    except Exception as e:  # noqa: BLE001
+        log.debug("pcm->wav failed: %s", str(e)[:80])
+        return b""
+
+
 async def _discord_speak(guild, text: str) -> bool:
     """Say the answer OUT LOUD in the voice channel the bot is sitting in.
 
@@ -10665,10 +10715,20 @@ async def _discord_runner() -> None:
         log.warning("DISCORD_TOKEN is set but discord.py is not installed - Discord is off. "
                     "Add 'discord.py>=2.4' to requirements.txt.")
         return
-    intents = discord.Intents.default()
-    intents.message_content = True
-    intents.voice_states = DISCORD_VC
+    # Message Content is a PRIVILEGED intent. If the portal toggle is off, Discord does not
+    # downgrade - it REFUSES the connection (close code 4014) and the bot never comes online.
+    # That is the number-one reason a Discord bot looks dead, so the first attempt asks for
+    # it and a second client runs WITHOUT it: slash commands and @mentions still work, and
+    # the reason is stated in the log, in /diag and once in the server.
+    def _make_intents(with_content: bool):
+        _i = discord.Intents.default()
+        _i.message_content = bool(with_content)
+        _i.voice_states = DISCORD_VC
+        return _i
+
+    intents = _make_intents(True)
     client = discord.Client(intents=intents)
+    _DISCORD_STATE["degraded"] = ""
     tree = app_commands.CommandTree(client)
 
     @client.event
@@ -10692,6 +10752,21 @@ async def _discord_runner() -> None:
         if not _DISCORD_REMINDERS_STARTED:
             _DISCORD_REMINDERS_STARTED = True
             asyncio.create_task(_discord_reminder_loop(client))
+        # A restart while people are already sitting in the voice channel used to leave the
+        # bot outside until someone re-joined. Walk in on ready instead.
+        if DISCORD_VC and DISCORD_VOICE_CHANNEL:
+            for _g in client.guilds:
+                for _ch in getattr(_g, "voice_channels", []) or []:
+                    if (_ch.name or "").lower() != DISCORD_VOICE_CHANNEL.lower():
+                        continue
+                    if not [m for m in getattr(_ch, "members", []) if not m.bot]:
+                        continue
+                    try:
+                        if _g.voice_client is None:
+                            await _ch.connect(self_deaf=False)
+                            log.info("discord: joined '%s' on startup", _ch.name)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("discord: startup join failed (%s)", str(e)[:100])
         try:
             if DISCORD_GUILD_ID:
                 # copy_global_to() only fills the guild's command list. sync() WITHOUT the
@@ -10879,6 +10954,15 @@ async def _discord_runner() -> None:
         try:
             import nacl  # presence check: voice needs it
             _ = nacl.__version__ if hasattr(nacl, '__version__') else True
+            # Opus is what Discord actually streams. Without libopus the voice client
+            # connects and then plays nothing, with no error - so it is checked up front.
+            try:
+                if not discord.opus.is_loaded():
+                    discord.opus.load_opus("libopus.so.0")
+            except Exception as e:  # noqa: BLE001
+                log.warning("discord: libopus is not loaded (%s) - voice will connect but "
+                            "stay silent. Install it on the host: apt-get install -y "
+                            "libopus0", str(e)[:80])
 
             @client.event
             async def on_voice_state_update(member, before, after):  # noqa: ANN202
@@ -10894,10 +10978,11 @@ async def _discord_runner() -> None:
                     if _joined is not None and (_joined.name or "").lower() == _target:
                         vc = guild.voice_client
                         if vc is None:
-                            await _joined.connect(self_deaf=False)
+                            vc = await _joined.connect(self_deaf=False)
                             log.info("discord: joined voice channel '%s'", _joined.name)
                         elif getattr(vc, "channel", None) != _joined:
                             await vc.move_to(_joined)
+                        await _start_listening(vc, guild, _paired_text(guild))
                     vc = guild.voice_client
                     if (vc is not None and getattr(vc, "channel", None) is not None
                             and (vc.channel.name or "").lower() == _target):
@@ -10908,6 +10993,97 @@ async def _discord_runner() -> None:
                 except Exception as e:  # noqa: BLE001
                     log.warning("discord: voice state update failed (%s)", str(e)[:120])
 
+            def _paired_text(guild):  # noqa: ANN001, ANN202
+                """The text channel the voice answers are posted in."""
+                for _c in getattr(guild, "text_channels", []) or []:
+                    if (getattr(_c, "name", "") or "").lower() in DISCORD_SPEAK_CHANNELS:
+                        return _c
+                return getattr(guild, "system_channel", None) or (
+                    (getattr(guild, "text_channels", []) or [None])[0])
+
+            async def _start_listening(vc, guild, text_channel):  # noqa: ANN001, ANN202
+                """Hear people in the voice channel: PCM -> silence -> Whisper -> answer.
+
+                discord.py cannot receive audio by itself, so this needs the community
+                extension `discord-ext-voice-recv` (not on PyPI). Without it the bot still
+                speaks; it just cannot hear. One clear line, not a silent failure.
+                """
+                try:
+                    from discord.ext import voice_recv
+                except ImportError:
+                    log.warning("discord: voice INPUT needs "
+                                "`pip install git+https://github.com/imayhaveborkedit/"
+                                "discord-ext-voice-recv` - the bot will speak but not hear")
+                    return False
+                try:
+                    class _Sink(voice_recv.AudioSink):  # noqa: D401
+                        def __init__(self):
+                            super().__init__()
+                            self.buf = {}
+                            self.last = {}
+
+                        def wants_opus(self):
+                            return False
+
+                        def write(self, user, data):
+                            if user is None or getattr(user, "bot", False):
+                                return
+                            pcm = getattr(data, "pcm", None)
+                            if not pcm:
+                                return
+                            uid = getattr(user, "id", 0)
+                            self.buf.setdefault(uid, bytearray()).extend(pcm)
+                            self.last[uid] = time.time()
+
+                        def cleanup(self):
+                            self.buf.clear()
+
+                    sink = _Sink()
+                    vc.listen(sink)
+
+                    async def _pump():
+                        while getattr(vc, "is_connected", lambda: False)():
+                            await asyncio.sleep(1.0)
+                            now = time.time()
+                            for uid, chunk in list(sink.buf.items()):
+                                # 1.2 s of silence ends an utterance
+                                if now - sink.last.get(uid, 0) < 1.2:
+                                    continue
+                                data = bytes(chunk)
+                                sink.buf[uid] = bytearray()
+                                if len(data) < 48000 * 2 * 0.4:      # under ~0.4 s of audio
+                                    continue
+                                try:
+                                    wav = await _pcm48_stereo_to_wav(data)
+                                    if not wav:
+                                        continue
+                                    txt = await transcribe_groq(wav, "vc.wav", "audio/wav")
+                                    if not txt or len(txt.strip()) < 2:
+                                        continue
+                                    log.info("discord vc heard: %s", txt[:60])
+                                    out = await _discord_answer(
+                                        txt, getattr(text_channel, "name", "") or "",
+                                        getattr(guild, "name", "") or "",
+                                        _discord_chat_id(getattr(text_channel, "id", 0)),
+                                        "voice", user_id=uid)
+                                    if out:
+                                        if text_channel is not None:
+                                            try:
+                                                await text_channel.send(
+                                                    f"**{txt.strip()[:200]}**\n{out[:1500]}")
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        await _discord_speak(guild, out)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("discord vc utterance failed: %s", str(e)[:90])
+
+                    asyncio.create_task(_pump())
+                    log.info("discord: listening in '%s'", getattr(vc.channel, "name", "?"))
+                    return True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("discord: could not start listening (%s)", str(e)[:120])
+                    return False
+
             @tree.command(name="join", description="Join your voice channel")
             async def _join(interaction):  # noqa: ANN001, ANN202
                 vc = getattr(interaction.user, "voice", None)
@@ -10917,9 +11093,11 @@ async def _discord_runner() -> None:
                     return
                 try:
                     if interaction.guild.voice_client:
-                        await interaction.guild.voice_client.move_to(vc.channel)
+                        _vc = interaction.guild.voice_client
+                        await _vc.move_to(vc.channel)
                     else:
-                        await vc.channel.connect()
+                        _vc = await vc.channel.connect()
+                    await _start_listening(_vc, interaction.guild, _paired_text(interaction.guild))
                     await interaction.response.send_message(f"Joined {vc.channel.name}.")
                 except Exception as e:  # noqa: BLE001
                     await interaction.response.send_message(f"Could not join: {str(e)[:150]}",
@@ -10952,11 +11130,24 @@ async def _discord_runner() -> None:
     try:
         await client.start(DISCORD_TOKEN)
     except discord.PrivilegedIntentsRequired as e:
-        _DISCORD_STATE["last_error"] = ("MESSAGE CONTENT INTENT is off in the Discord "
-                                        "Developer Portal")
-        log.error("discord: gateway refused the connection (close code 4014). Enable "
-                  "MESSAGE CONTENT INTENT under Bot > Privileged Gateway Intents at "
-                  "discord.com/developers/applications, then redeploy. (%s)", str(e)[:100])
+        # Discord refused the whole connection. Rather than leaving the bot offline forever,
+        # reconnect without the privileged intent: /ask, /research and @mentions keep working.
+        _DISCORD_STATE["degraded"] = "message content intent is OFF"
+        _DISCORD_STATE["last_error"] = ("MESSAGE CONTENT INTENT is off - running in "
+                                        "slash/mention-only mode")
+        log.error("discord: gateway refused the connection (4014): the Message Content "
+                  "intent is off in the Developer Portal. Enable it under Bot > Privileged "
+                  "Gateway Intents (then restart), or leave it: I will run in "
+                  "slash-command + @mention mode. (%s)", str(e)[:100])
+        try:
+            _lc = discord.Client(intents=_make_intents(False))
+            for _nm, _fn in client.__dict__.items():
+                if _nm.startswith("on_") and callable(_fn):
+                    _lc.event(_fn)
+            await _lc.start(DISCORD_TOKEN)
+        except Exception as e2:  # noqa: BLE001
+            _DISCORD_STATE["last_error"] = "degraded connect failed: " + str(e2)[:120]
+            log.error("discord: degraded reconnect failed (%s)", str(e2)[:120])
     except discord.LoginFailure as e:
         _DISCORD_STATE["last_error"] = "bad DISCORD_TOKEN"
         log.error("discord: login failed - DISCORD_TOKEN must be the BOT token "
@@ -11626,6 +11817,10 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              "🌐 Pollinations text fallback: "
              + ("ON (opt-in)" if POLLINATIONS_TEXT_ENABLED else "off (opt-in only)"),
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
+             "🎧 Discord voice: " + (
+                 "ready (nacl+opus+recv)" if all(_voice_ready()[k] for k in ("nacl", "opus"))
+                 else "missing " + ", ".join(k for k, v in _voice_ready().items() if not v)),
+             "🔇 Discord intents: " + (_DISCORD_STATE.get("degraded") or "full"),
              "🎬 YouTube: " + ("Data API key set (official views/comments)"
                               if YOUTUBE_API_KEY else
                               f"no API key - {len(YT_PIPED_INSTANCES)} keyless mirror(s) + scrape"),

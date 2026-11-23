@@ -208,9 +208,22 @@ A channel in none of the lists answers freely, so the bot is never mysteriously 
 explicit `DISCORD_CHANNELS` allowlist still overrides all three.
 
 **Voice.** With `DISCORD_VC=true`, the bot walks into `avenor-live` (configurable) by itself when
-a person joins, speaks the answer it gives in the paired text channels (`DISCORD_SPEAK_CHANNELS`),
-and leaves when the channel empties. Hearing the *person* needs a voice-receive library —
-discord.py cannot receive audio on its own — so voice input is the next step, not a claim.
+a person joins — including on startup if someone is already there — speaks the answers it gives in
+the paired text channels (`DISCORD_SPEAK_CHANNELS`), and leaves when the channel empties.
+
+Four things have to be right, and each fails differently, so `/diag` reports them one by one:
+
+| Piece | Why | If missing |
+|---|---|---|
+| `discord.py >= 2.7.1` | voice channels use DAVE (E2EE) since March 2026 | the voice client connects and then fails **silently** |
+| `libopus` on the host | Discord streams Opus | joins, plays nothing, no error |
+| `PyNaCl` | voice encryption | voice commands never load |
+| `discord-ext-voice-recv` (GitHub, not PyPI) | discord.py **cannot** receive audio | bot speaks but cannot hear |
+
+**Message Content intent.** If the portal toggle is off, Discord refuses the whole connection
+(close code 4014) and the bot never comes online. This build catches that, reconnects **without**
+the privileged intent, and keeps working through `/ask`, `/research` and `@mentions` — with the
+reason printed in the log and in `/diag` instead of a bot that just looks dead.
 
 ---
 
