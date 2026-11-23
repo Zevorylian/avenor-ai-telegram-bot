@@ -2150,6 +2150,17 @@ _HUMOUR_LEAK_RE = re.compile(
     r"active\s+person|notice|regulation|clause)\b", re.I)
 
 
+# A promise is not a joke: "abhi check karke batata hoon" is the empty reply that looks
+# like work. A quote invented about a real person ("Gandhi kehte the ...") is worse than a
+# bad joke - it is a fabricated claim about someone real, so it never passes either.
+_HUMOUR_PROMISE_RE = re.compile(
+    r"\b(?:check|dekh|search|dhundo|verify|confirm|pata\s*kar)\w*\b[\s\S]{0,40}"
+    r"\b(?:batata|batati|bataunga|bata\s*doonga|update\s*kar|bolta|batayenge)\w*", re.I)
+_HUMOUR_CLAIM_RE = re.compile(
+    r"\b(?:kehte\s+the|kehta\s+tha|kaha\s+tha|kahi\s+thi|likha\s+tha|"
+    r"used\s+to\s+say|said\s+that|believed\s+that|once\s+said)\b", re.I)
+
+
 def _humour_reply_ok(ans: str) -> bool:
     """Deterministic check: does this reply to a joke actually read like a joke reply?
 
@@ -2161,7 +2172,7 @@ def _humour_reply_ok(ans: str) -> bool:
         return False
     if len(t.split()) > 24 or t.count("\n") > 2:
         return False
-    if _HUMOUR_LEAK_RE.search(t):
+    if _HUMOUR_LEAK_RE.search(t) or _HUMOUR_PROMISE_RE.search(t) or _HUMOUR_CLAIM_RE.search(t):
         return False
     if re.search(r"\[\s*(?:file|search|quote|image|remind)\s*:", t, re.I):
         return False
@@ -2200,6 +2211,57 @@ async def _humour_fix(chat_id, text: str, ans: str, lang: str,
     picked = pool[len(text or "") % len(pool)]
     log.info("humour guard: using the deterministic fallback %r", picked)
     return picked
+
+
+# --- promise guard ------------------------------------------------------------------
+# "Abhi check karke batata hoon." and then nothing is the single worst reply this bot can
+# send: it looks like work, delivers none, and the person has to ask again. Any reply that
+# is ONLY a promise is caught here and answered for real (or honestly refused).
+_PROMISE_ONLY_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?|theek|thik|sure|haan|hmm|ek\s*second|ruko|wait|one\s*sec)?"
+    r"[\s,:.!-]*"
+    r"(?:main\s+|i\s+will\s+|i'?ll\s+|let\s+me\s+)?"
+    r"(?:abhi\s+|now\s+)?"
+    r"(?:check|dekh|dekhe|search|dhundo|verify|confirm|pata\s*kar|look\s*up)\w*"
+    r"[\s\S]{0,50}?"
+    r"(?:batata|batati|bataunga|bata\s*doonga|batayenge|bolta|update\s*kar\w*|"
+    r"get\s+back|let\s+you\s+know|tell\s+you)"
+    r"[\s\S]{0,20}?[.!]*\s*$"
+    # ...and the bare "ek second, check karta hoon" shape, which promises nothing explicit.
+    r"|^\s*(?:ok(?:ay)?|theek|thik|sure|ek\s*second|ruko|wait|one\s*sec)?[\s,:.!-]*"
+    r"(?:main\s+|let\s+me\s+)?(?:abhi\s+|now\s+)?"
+    r"(?:check|dekh|dekhe|search|dhundo|verify|confirm|look\s*up)\w*"
+    r"[\s\S]{0,30}?(?:karta|karti|karke|kar)\s*(?:hoon|hun|hu|raha|rahi)\b[\s.!]*$",
+    re.I)
+
+_NO_PROMISE_FALLBACK = {
+    "hinglish": "Iska pakka jawab abhi mere paas nahi hai. Thoda saaf bolo kis cheez ka pata "
+                "karna hai - main exact bata dunga.",
+    "hindi": "इसका पक्का जवाब अभी मेरे पास नहीं है। थोड़ा साफ़ बताइए किस चीज़ का पता करना है - "
+             "मैं सही जानकारी दूँगा।",
+    "english": "I don't have a solid answer for that yet. Tell me a little more and I'll give "
+               "you the exact thing.",
+}
+
+
+async def _no_promise_fix(chat_id, text: str, lang: str,
+                          image=None, audio=None, doc=None) -> str:
+    """Replace a promise-only reply with a real answer, or an honest one-liner."""
+    log.info("promise guard: reply was only a promise - answering for real")
+    out = ""
+    try:
+        out = await ask_gemini(
+            chat_id,
+            "Answer this message NOW in at most 30 words. Never say you will check, look "
+            "up, search, verify or get back to them. If you do not know, say so in one line "
+            "and give the closest useful detail.\nMessage: " + (text or "")[:300],
+            "", image, audio, doc, effort="fast")
+    except Exception as e:  # noqa: BLE001
+        log.debug("promise repair call failed: %s", str(e)[:100])
+    out = (out or "").strip()
+    if out and not _PROMISE_ONLY_RE.match(out):
+        return out
+    return _NO_PROMISE_FALLBACK.get((lang or "").lower()) or _NO_PROMISE_FALLBACK["hinglish"]
 
 
 _FILE_BLOCK_RE = re.compile(
@@ -5833,6 +5895,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # Code has the last word on a joke turn (see _humour_reply_ok).
             if _humour and ans and "[file:" not in (ans or "").lower():
                 ans = await _humour_fix(chat_id, text, ans, lang, image, audio, doc)
+
+            # ---- PROMISE GUARD ---------------------------------------------------
+            # Runs for every turn, not only jokes: a promise-only reply is never useful.
+            if ans and _PROMISE_ONLY_RE.match((ans or "").strip()):
+                ans = await _no_promise_fix(chat_id, text, lang, image, audio, doc)
 
             # ---- AUTONOMOUS FILE / VOICE / IMAGE --------------------------------
             # A reply may carry up to MAX_FILES_PER_REPLY blocks: a website is usually
