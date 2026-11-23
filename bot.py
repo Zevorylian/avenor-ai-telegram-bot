@@ -6703,37 +6703,99 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if _stub_files:
                     ans = (ans + "\n\n" + str(_stub_files) + " file khaali thi, isliye nahi "
                            "bheji - dobara bolo to theek se bana dunga.").strip()
-                # The person asked for specific formats; a model that writes two of three
-                # must be asked once for the rest instead of silently under-delivering.
+                # ---- TOP UP THE MISSING FORMATS ------------------------------------
+                # "1. html 2. md 3. pdf" gave html + md and no pdf. Waiting for a second
+                # model call is how that stayed missing: by this point the turn budget can
+                # be spent, and a model asked again often repeats itself. pdf, md and txt
+                # can be built from text we ALREADY have, so they are built here in code -
+                # no model, no quota, no wait. Only html (which needs real markup) still
+                # goes to the model, once.
                 _want_exts = _requested_exts(text or "")
                 if _want_exts and _sent_names:
                     _got_exts = {(n.rsplit(".", 1)[-1].lower() if "." in n else "")
                                  for n in _sent_names}
                     _missing = sorted(e for e in (_want_exts - _got_exts) if e)
                     if _missing:
-                        log.info("missing formats after delivery: %s - asking once",
-                                 _missing)
-                        try:
-                            _ask = ("The person asked for these file formats and they are "
-                                    "still missing: " + ", ".join("." + e for e in _missing[:3])
-                                    + ". Write ONLY those files now, each in its own "
-                                    "[file: name.ext] ... [/file] block with real content. "
-                                    "No commentary outside the blocks.")
-                            _fix = await ask_gemini(chat_id, _ask, "", None, None, None,
-                                                    effort="fast")
-                            _f2, _q2, _o2, _e2 = _collect_file_blocks(_fix or "", 3,
-                                                                      _pdf_only_request(text or ""))
-                            if _q2:
-                                _n2 = await send_made_files(c.bot, chat_id, _q2)
-                                if _n2:
-                                    _names2 = ", ".join("`" + _x + "`" for _x in _n2)
-                                    ans = (ans + "\n\n" + _msg(
-                                        lang,
-                                        en="Also added: " + _names2,
-                                        hi="ये भी जोड़ दी: " + _names2,
-                                        hinglish="Ye bhi add kar di: " + _names2)).strip()
-                        except Exception as e:  # noqa: BLE001
-                            log.info("missing-format repair failed: %s", str(e)[:90])
+                        _text_src, _src_name = "", filed_name or "file"
+                        for _nm, _bd in _ready:
+                            _e = _nm.rsplit(".", 1)[-1].lower() if "." in _nm else ""
+                            if _e in ("md", "txt") and (_bd or "").strip():
+                                _text_src, _src_name = _bd, _nm
+                                break
+                        if not _text_src:
+                            for _nm, _bd in _ready:
+                                _e = _nm.rsplit(".", 1)[-1].lower() if "." in _nm else ""
+                                if _e in ("html", "htm") and (_bd or "").strip():
+                                    _text_src, _src_name = _strip_html(_bd), _nm
+                                    break
+                        _base = (_src_name.rsplit(".", 1)[0] if "." in _src_name
+                                 else _src_name) or "file"
+                        _made: list = []
+                        _need_model: list = []
+                        _note_pdf_txt = False
+                        for _e in _missing:
+                            if _e == "pdf":
+                                if _text_src.strip() and _latin_ok(_text_src):
+                                    _made.append((_base + ".pdf", _text_src))
+                                elif _text_src.strip():
+                                    # Devanagari cannot be drawn by the built-in writer; a
+                                    # .txt with the real words beats a PDF full of "?".
+                                    _made.append((_base + ".txt", _text_src))
+                                    _note_pdf_txt = True
+                            elif _e in ("md", "txt") and _text_src.strip():
+                                _made.append((_base + "." + _e, _text_src))
+                            elif _e in ("html", "htm") and _text_src.strip():
+                                _made.append((_base + ".html",
+                                              "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                                              "<meta charset=\"utf-8\">\n<title>"
+                                              + html.escape(_base[:60]) +
+                                              "</title>\n<style>body{max-width:46rem;"
+                                              "margin:2rem auto;padding:0 1rem;"
+                                              "font:16px/1.6 system-ui,sans-serif}"
+                                              "pre{white-space:pre-wrap}</style>\n</head>\n"
+                                              "<body>\n<pre>" + html.escape(_text_src) +
+                                              "</pre>\n</body>\n</html>"))
+                            else:
+                                _need_model.append(_e)
+                        _added: list = []
+                        if _made:
+                            _added = await send_made_files(c.bot, chat_id, _made)
+                            log.info("top-up built from existing text: %s", _added)
+                        if _need_model:
+                            log.info("formats only a model can write: %s", _need_model)
+                            try:
+                                _ask = ("The person asked for these file formats and they are "
+                                        "still missing: "
+                                        + ", ".join("." + e for e in _need_model[:3])
+                                        + ". Write ONLY those files now, each in its own "
+                                        "[file: name.ext] ... [/file] block with real "
+                                        "content. No commentary outside the blocks.")
+                                _fix = await ask_gemini(chat_id, _ask, "", None, None, None,
+                                                        effort="fast")
+                                _f2, _q2, _o2, _e2 = _collect_file_blocks(
+                                    _fix or "", 3, _pdf_only_request(text or ""))
+                                if _q2:
+                                    _added += await send_made_files(c.bot, chat_id, _q2)
+                            except Exception as e:  # noqa: BLE001
+                                log.info("missing-format model repair failed: %s",
+                                         str(e)[:90])
+                        if _added:
+                            _names2 = ", ".join("`" + _x + "`" for _x in _added)
+                            ans = (ans + "\n\n" + _msg(
+                                lang,
+                                en="Also added: " + _names2,
+                                hi="ये भी जोड़ दी: " + _names2,
+                                hinglish="Ye bhi add kar di: " + _names2)).strip()
+                        if _note_pdf_txt:
+                            ans = (ans + "\n\n" + _msg(
+                                lang,
+                                en="I could not build a PDF: this text is Devanagari/regional "
+                                   "and the built-in PDF writer is Latin-1 only, so I sent a TXT.",
+                                hi="PDF नहीं बनी: इस टेक्स्ट में देवनागरी है और अंदर का PDF "
+                                   "writer सिर्फ़ Latin-1 लिखता है, इसलिए TXT भेजी।",
+                                hinglish="PDF nahi banayi: is text me Devanagari/regional "
+                                         "script hai aur andar ka PDF writer sirf Latin-1 "
+                                         "likhta hai, isliye TXT bheji.")).strip()
             # A block so short it was dropped before delivery still has to be explained:
             # silence looks like the bot ignored the request.
             if _empty and not file_sent and not _queue:

@@ -162,6 +162,9 @@ it. Never paste the file content into the chat as well.
 - Extensions: md, txt, csv, json, py, js, ts, html, css, sql, yaml, xml, pdf.
 - Every file needs real content, not a stub. A 20-line page or a 5-line note is a failed \
 answer - write the thing they asked for.
+- If they LIST formats ("1. html 2. md 3. pdf"), write one file per listed format, in that \
+order, with the same content in each. Three formats listed means three blocks - not two, \
+and not one file with three names.
 - Code must run: complete files, imports included, no "..." placeholders, no TODOs where the logic \
 should be.
 - A page must be finished: every section they named, working navigation, real content in their \
