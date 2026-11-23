@@ -94,6 +94,7 @@ system runs it. If a tag is skipped, never promise the thing it would have produ
    [skip] - only in a group, when the message is not for you; send it alone.
    [search: query] - when the answer could have changed (price, rate, date, ranking, who, latest).
    [file: name.ext] ... [/file] - when they asked for a document, code, page or project.
+   [book: title or author] - when they asked for a book; the system fetches a real file.
    [image: what to draw], [remind: 2h | what], [calc: expression], [convert: 100 usd to inr],
    [date: 2026-11-08], [time: Asia/Kolkata], [voice] - only when that exact thing is needed.
    Ordinary conversation is the default. Most replies use no tag at all.
@@ -225,8 +226,22 @@ multiplier or an "X times" number - nobody can measure that.
 - A prompt cannot add capability. Retrieval, tools and a better model can.
 """
 
+PACK_BOOKS = """=== MODE: BOOK ===
+They want a book: a novel, a classic, something to read, "kitaab".
+
+- Write [book: title or author] on its own line, and stop there. The system fetches a real
+  file from Project Gutenberg and attaches it.
+- Do NOT write the book, a chapter, or a fake file yourself. The system downloads the real
+  text and builds one clean PDF from it, so a book you invent is worse than useless.
+- Do NOT say it is sent before it is sent. One short line before the tag is fine.
+- If they named a recent, copyrighted title, say in one line that you can only send free
+  public-domain books, and give them the legal way to get it. Never promise a file you
+  cannot legally deliver, and never pretend you sent one.
+"""
+
 PACKS = {
     "humour": PACK_HUMOUR,
+    "books": PACK_BOOKS,
     "file": PACK_FILE,
     "research": PACK_RESEARCH,
     "warmth": PACK_WARMTH,
@@ -235,7 +250,7 @@ PACKS = {
 }
 
 # Order matters: the earlier a pack is, the more it wins when the budget is tight.
-PACK_ORDER = ("humour", "caps", "file", "warmth", "deep", "research")
+PACK_ORDER = ("humour", "books", "caps", "file", "warmth", "deep", "research")
 MAX_PACKS = 3
 
 # ---------------------------------------------------------------------------
@@ -306,6 +321,12 @@ _DEEP = re.compile(
     r"step\s*by\s*step|kaise\s+kar\w*|kaise\s+ban\w*|kaise\s+fix|explain\s+why|"
     r"samjhao|samjha\s*do|kyun\s+(?:kaam|hota|nahi)|why\s+does)\b", re.I)
 
+# A book request is its own intent: it must beat the "build a file" pack, because the
+# model writing a book itself is exactly the failure this pack exists to stop.
+_BOOK_WANT = re.compile(
+    r"\b(?:book|books|kitaab|kitab|novel|ebook|e-book|gutenberg|"
+    r"padhne\s+ke\s+liye|read(?:ing)?\s+(?:a|the|this)\s+book)\b", re.I)
+
 _RESEARCH = re.compile(
     r"\b(?:price|rate|bhav|bhaav|keemat|daam|kitna\s+chal\s+raha|"
     r"top|best|sabse|latest|newest|aaj\s+ka|aaj\s+kitna|kab\s+hai|kab\s+hoga|"
@@ -358,6 +379,8 @@ def pick_packs(text: str) -> list[str]:
         # Humour outranks everything: a joke answered as a task is the worst failure
         # this bot has, and it is the one users screenshot.
         add("humour")
+    if _BOOK_WANT.search(t):
+        add("books")
     if _CAPS.search(t):
         add("caps")
     if _FILE.search(t) and (_BUILD_VERB.search(t) or re.search(r"\.(?:md|py|js|html|css|json|csv|pdf)\b", t, re.I)):
@@ -375,6 +398,10 @@ def pick_packs(text: str) -> list[str]:
         # "work it out step by step"). Humour wins, and only an explicit build request
         # may travel with it.
         want = [n for n in want if n in ("humour", "file")]
+    if "books" in want:
+        # A book is fetched, not written: the build pack would tell the model to write the
+        # book itself, which is the one thing that must not happen.
+        want = [n for n in want if n != "file"]
 
     ordered = [n for n in PACK_ORDER if n in want]
     return ordered[:MAX_PACKS]

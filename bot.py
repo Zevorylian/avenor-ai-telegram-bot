@@ -2154,6 +2154,372 @@ def _humour_mode(text: str) -> bool:
     return "humour" in names and "file" not in names
 
 
+# --- free books (public domain only) --------------------------------------------------
+# A user who asks for a book gets a real file, with no command and no keyword: the model
+# signals [book: title or author] and the code fetches it. The sources are the LEGAL free
+# ones - Project Gutenberg through Gutendex (no API key, 70k+ books, EPUB/TXT/HTML) - plus
+# Internet Archive and Open Library for everything else. Shadow libraries are deliberately
+# not wired in: they are piracy, and a bot that ships them gets its token revoked.
+BOOKS_ENABLED = os.environ.get("BOOKS_ENABLED", "true").lower() not in ("0", "false", "no")
+BOOK_MAX_BYTES = int(os.environ.get("BOOK_MAX_BYTES", "12000000") or "12000000")
+_BOOK_TAG_RE = re.compile(r"\[\s*book\s*:\s*([^\]\n]{2,120})\]", re.I)
+_BOOK_WANT_RE = re.compile(
+    r"\b(?:book|books|kitaab|kitab|novel|ebook|e-book|gutenberg|"
+    r"padhne\s+ke\s+liye|read(?:ing)?\s+(?:a|the|this)\s+book)\b", re.I)
+_BOOK_STOP = {"book", "books", "kitaab", "kitab", "novel", "ebook", "e-book", "pdf", "epub",
+              "mujhe", "muje", "mera", "meri", "chahiye", "chaiye", "do", "de", "bhejo",
+              "bhej", "kar", "karo", "dedo", "de", "please", "plz", "ka", "ki", "ke", "the",
+              "a", "an", "of", "for", "me", "my", "want", "need", "send", "download", "file",
+              "ka", "kuch", "koi", "any", "this", "that"}
+_BOOK_CACHE: dict = {}
+_BOOK_TTL = 6 * 3600
+
+
+def _book_query(text: str) -> str:
+    """The words left after removing the request itself. Pure."""
+    words = [w for w in re.findall(r"[\w'\u0900-\u097F]+", text or "")]
+    keep = [w for w in words if w.lower() not in _BOOK_STOP and len(w) > 1]
+    return " ".join(keep)[:120]
+
+
+async def _gutenberg_html(query: str) -> list:
+    """Fallback search on gutenberg.org itself, for when Gutendex is down or blocked.
+
+    Gutendex is a community service with no uptime promise, so the catalogue search has a
+    second keyless path: the site's own search page, then the per-book EPUB URL. This is
+    what keeps "send me a book" working when the API is unreachable.
+    """
+    try:
+        r = await HTTP.get("https://www.gutenberg.org/ebooks/search/",
+                           params={"query": query}, timeout=18,
+                           headers={"User-Agent": _UA_WEB})
+        if r.status_code != 200:
+            log.info("gutenberg search HTTP %s for %r", r.status_code, query[:40])
+            return []
+        ids = []
+        for _id in re.findall(r"/ebooks/(\d{2,7})", r.text or ""):
+            if _id not in ids:
+                ids.append(_id)
+        out = []
+        for _id in ids[:3]:
+            out.append({
+                "id": int(_id),
+                "title": "",
+                "authors": "",
+                "downloads": 0,
+                "formats": {
+                    "application/epub+zip":
+                        f"https://www.gutenberg.org/ebooks/{_id}.epub.noimages",
+                    "text/plain; charset=utf-8":
+                        f"https://www.gutenberg.org/cache/epub/{_id}/pg{_id}.txt",
+                },
+                "page": f"https://www.gutenberg.org/ebooks/{_id}",
+            })
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.info("gutenberg search failed: %s", str(e)[:90])
+        return []
+
+
+async def _book_search(query: str, lang: str = "") -> list:
+    """Catalogue search with a fallback: Gutendex first, gutenberg.org second."""
+    rows = await _gutendex(query, lang)
+    if rows:
+        return rows
+    log.info("gutendex empty for %r - trying gutenberg.org search", query[:40])
+    rows = await _gutenberg_html(query)
+    if rows:
+        return rows
+    log.info("gutenberg.org empty for %r - trying archive.org", query[:40])
+    return await _archive_search(query)
+
+
+async def _gutendex(query: str, lang: str = "") -> list:
+    """Search Project Gutenberg's catalogue. No key, no account. [] on any failure."""
+    if not query:
+        return []
+    hit = _BOOK_CACHE.get(query.lower())
+    if hit and (time.time() - hit[0]) < _BOOK_TTL:
+        return hit[1]
+    params = {"search": query}
+    if lang:
+        params["languages"] = lang
+    try:
+        r = await HTTP.get("https://gutendex.com/books", params=params, timeout=15,
+                           headers={"User-Agent": _UA_WEB, "Accept": "application/json"})
+        if r.status_code != 200:
+            log.info("gutendex HTTP %s for %r", r.status_code, query[:40])
+            return []
+        rows = (r.json() or {}).get("results") or []
+    except Exception as e:  # noqa: BLE001
+        log.info("gutendex failed for %r: %s", query[:40], str(e)[:90])
+        return []
+    out = []
+    for b in rows[:6]:
+        if not isinstance(b, dict):
+            continue
+        fmt = b.get("formats") or {}
+        # Gutendex sends authors as [{"name": ...}]; older mirrors send a plain string.
+        # A shape change must never crash a reply, so both are accepted.
+        _auth = b.get("authors") or []
+        if isinstance(_auth, str):
+            _names = _auth
+        else:
+            _names = ", ".join((a.get("name") or "") for a in _auth
+                               if isinstance(a, dict))
+        out.append({
+            "id": b.get("id"),
+            "title": (b.get("title") or "").strip(),
+            "authors": _names[:120],
+            "formats": fmt if isinstance(fmt, dict) else {},
+            "downloads": b.get("download_count") or 0,
+        })
+    _BOOK_CACHE[query.lower()] = (time.time(), out)
+    return out
+
+
+BOOK_TEXT_LIMIT = int(os.environ.get("BOOK_TEXT_LIMIT", "400000") or "400000")
+
+
+def _epub_text(data: bytes) -> str:
+    """Every readable word out of an EPUB (a zip of XHTML files). Never raises."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as e:  # noqa: BLE001
+        log.info("epub unzip failed: %s", str(e)[:80])
+        return ""
+    parts = []
+    for name in zf.namelist():
+        low = name.lower()
+        if not low.endswith((".xhtml", ".html", ".htm", ".txt")):
+            continue
+        try:
+            raw = zf.read(name).decode("utf-8", "ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        txt = _strip_html(raw) if low.endswith((".xhtml", ".html", ".htm")) else raw
+        if txt.strip():
+            parts.append(txt.strip())
+    return "\n\n".join(parts)
+
+
+def _strip_gutenberg(text: str) -> str:
+    """Drop the Project Gutenberg licence wrapper. Pure."""
+    t = text or ""
+    m = re.search(r"\*\*\* ?START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK.*?\*\*\*", t, re.I | re.S)
+    if m:
+        t = t[m.end():]
+    m2 = re.search(r"\*\*\* ?END OF (?:THE|THIS) PROJECT GUTENBERG EBOOK", t, re.I)
+    if m2:
+        t = t[:m2.start()]
+    return t.strip()
+
+
+def _latin_ok(text: str) -> bool:
+    """Can the built-in PDF writer represent this text? Pure.
+
+    The writer uses the 14 standard PDF fonts, which are Latin-1 only: a Hindi or Bengali
+    book would come out as question marks. In that case the original EPUB/TXT is sent
+    instead of a broken PDF - honest beats pretty.
+    """
+    sample = (text or "")[:20000]
+    if not sample:
+        return False
+    ok = sum(1 for ch in sample if ord(ch) < 0x250)
+    return (ok / len(sample)) > 0.98
+
+
+async def _archive_search(query: str) -> list:
+    """Public-domain texts on archive.org. Keyless, and it has its own catalogue API."""
+    if not query:
+        return []
+    try:
+        r = await HTTP.get("https://archive.org/advancedsearch.php", params={
+            "q": f"title:({query}) AND mediatype:texts",
+            "fl[]": ["identifier", "title", "creator"], "rows": "4", "output": "json",
+        }, timeout=18, headers={"User-Agent": _UA_WEB, "Accept": "application/json"})
+        if r.status_code != 200:
+            return []
+        docs = (((r.json() or {}).get("response") or {}).get("docs")) or []
+    except Exception as e:  # noqa: BLE001
+        log.info("archive.org search failed for %r: %s", query[:40], str(e)[:90])
+        return []
+    out = []
+    for d in docs:
+        if not isinstance(d, dict) or not d.get("identifier"):
+            continue
+        out.append({
+            "archive_id": d["identifier"],
+            "title": (d.get("title") or "").strip() if isinstance(d.get("title"), str)
+                     else " ".join(d.get("title") or [])[:160],
+            "authors": (d.get("creator") if isinstance(d.get("creator"), str)
+                        else ", ".join(d.get("creator") or []))[:120],
+            "formats": {},
+            "downloads": 0,
+        })
+    return out
+
+
+async def _archive_text(identifier: str) -> str:
+    """The OCR text of an archive.org item (the `_djvu.txt` file every scanned text has)."""
+    try:
+        m = await HTTP.get(f"https://archive.org/metadata/{identifier}", timeout=18,
+                           headers={"User-Agent": _UA_WEB, "Accept": "application/json"})
+        if m.status_code != 200:
+            return ""
+        files = (m.json() or {}).get("files") or []
+    except Exception as e:  # noqa: BLE001
+        log.info("archive metadata failed for %s: %s", identifier, str(e)[:80])
+        return ""
+    pick = None
+    for f in files:
+        name = (f.get("name") or "")
+        if name.endswith("_djvu.txt"):
+            pick = name
+            break
+    if not pick:
+        for f in files:
+            name = (f.get("name") or "")
+            if name.lower().endswith(".txt") and "meta" not in name.lower():
+                pick = name
+                break
+    if not pick:
+        return ""
+    try:
+        r = await HTTP.get(f"https://archive.org/download/{identifier}/{pick}", timeout=40,
+                           headers={"User-Agent": _UA_WEB})
+        if r.status_code != 200:
+            return ""
+        return (r.text or "")[:BOOK_TEXT_LIMIT * 2]
+    except Exception as e:  # noqa: BLE001
+        log.info("archive text download failed for %s: %s", identifier, str(e)[:80])
+        return ""
+
+
+def _book_author(book: dict) -> str:
+    """The author as plain text, whatever shape the catalogue used. Pure."""
+    a = (book or {}).get("authors")
+    if isinstance(a, str):
+        return a
+    if isinstance(a, list):
+        return ", ".join((x.get("name") or "") for x in a if isinstance(x, dict))
+    return ""
+
+
+def _book_pick_file(book: dict, want_pdf: bool = False) -> tuple:
+    """Choose the best downloadable file for a Gutendex book. Pure.
+
+    EPUB keeps chapters and pictures; plain text is the widest fallback; a PDF request is
+    served by converting the text with the bot's own writer.
+    """
+    fmt = book.get("formats") or {}
+    order = [("application/epub+zip", "epub"),
+             ("application/x-mobipocket-ebook", "mobi"),
+             ("text/plain; charset=utf-8", "txt"),
+             ("text/plain; charset=us-ascii", "txt"),
+             ("text/html; charset=utf-8", "html"),
+             ("text/html", "html")]
+    if want_pdf:
+        order = [("text/plain; charset=utf-8", "txt"),
+                 ("text/plain; charset=us-ascii", "txt"),
+                 ("application/epub+zip", "epub"),
+                 ("text/html; charset=utf-8", "html")]
+    for mime, ext in order:
+        url = fmt.get(mime)
+        if url:
+            return url, ext
+    for mime, url in fmt.items():
+        if mime.startswith(("text/plain", "application/epub", "text/html")):
+            return url, ("epub" if "epub" in mime else
+                         "html" if "html" in mime else "txt")
+    return "", ""
+
+
+async def _book_download(book: dict, want_pdf: bool = False) -> tuple:
+    """(filename, bytes, note). ('', b'', reason) when it cannot be fetched."""
+    if not book.get("title") and book.get("page"):
+        # The HTML fallback only knows an ID; the book page carries the real title.
+        try:
+            pr = await HTTP.get(book["page"], timeout=15, headers={"User-Agent": _UA_WEB})
+            if pr.status_code == 200:
+                mt = re.search(r"<title>(.*?)</title>", pr.text or "", re.S | re.I)
+                if mt:
+                    book["title"] = re.sub(r"\s*\|.*$", "", html.unescape(mt.group(1))).strip()
+        except Exception as e:  # noqa: BLE001
+            log.debug("book page title failed: %s", str(e)[:70])
+    # archive.org has no "formats" map: its text is the OCR file, fetched separately.
+    if book.get("archive_id") and not book.get("formats"):
+        text = await _archive_text(book["archive_id"])
+        if not text.strip():
+            return "", b"", "archive.org item has no text file"
+        text = _strip_gutenberg(text)
+        title = re.sub(r"[^\w\- ]+", "", book.get("title") or "book")[:60].strip() or "book"
+        author = re.sub(r"[^\w\- ]+", "", _book_author(book).split(",")[0])[:30].strip()
+        base = (title + (" - " + author if author else "")).strip()
+        if _latin_ok(text):
+            return f"{base}.pdf", _text_to_pdf(text[:BOOK_TEXT_LIMIT], base + ".pdf"), ""
+        return f"{base}.txt", text[:BOOK_TEXT_LIMIT].encode("utf-8"), ""
+
+    url, ext = _book_pick_file(book, want_pdf)
+    if not url:
+        return "", b"", "no downloadable format"
+    try:
+        r = await HTTP.get(url, timeout=25, headers={"User-Agent": _UA_WEB},
+                           follow_redirects=True)
+        if r.status_code != 200 or not r.content:
+            return "", b"", f"HTTP {r.status_code}"
+        data = r.content
+        if len(data) > BOOK_MAX_BYTES:
+            return "", b"", "too large"
+    except Exception as e:  # noqa: BLE001
+        return "", b"", str(e)[:80]
+    title = re.sub(r"[^\w\- ]+", "", book.get("title") or "book")[:60].strip() or "book"
+    author = re.sub(r"[^\w\- ]+", "", _book_author(book).split(",")[0])[:30].strip()
+    name = (title + (" - " + author if author else "")).strip()
+
+    # The book is rebuilt as OUR OWN PDF from its text, the way it was asked for:
+    # download -> take the text out -> throw the download away (it only ever lived in
+    # memory) -> write one clean PDF. Nothing is ever saved to disk, so there is no temp
+    # file to clean up and nothing left behind on the server.
+    text = ""
+    try:
+        if ext == "epub":
+            text = _epub_text(data)
+        elif ext in ("html", "htm"):
+            text = _strip_html(data.decode("utf-8", "ignore"))
+        else:
+            text = data.decode("utf-8", "ignore")
+        text = _strip_gutenberg(text)
+    except Exception as e:  # noqa: BLE001
+        log.info("book text extraction failed for %s: %s", name[:40], str(e)[:80])
+    if text.strip():
+        if _latin_ok(text):
+            try:
+                data = _text_to_pdf(text[:BOOK_TEXT_LIMIT], name + ".pdf")
+                ext = "pdf"
+            except Exception as e:  # noqa: BLE001
+                log.info("book pdf build failed: %s", str(e)[:80])
+        else:
+            # Devanagari/Bengali/Tamil etc: the built-in writer is Latin-1 only, so a PDF
+            # would be full of "?". The readable file wins over the pretty format.
+            data = text[:BOOK_TEXT_LIMIT].encode("utf-8")
+            ext = "txt"
+    return f"{name}.{ext}", data, ""
+
+
+async def _send_book(bot, chat_id: int, name: str, data: bytes, caption: str) -> bool:
+    """One document, no album, no preview."""
+    try:
+        await rate_gate(chat_id)
+        await bot.send_document(chat_id=chat_id, document=io.BytesIO(data),
+                                filename=name, caption=caption[:1000])
+        log.info("sent book %r (%s bytes) to %s", name, len(data), chat_id)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("send_book failed for %s: %s", name, str(e)[:120])
+        return False
+
+
 # --- data-use consent ---------------------------------------------------------------
 # Default ON, the way ChatGPT's "Improve the model for everyone" is on by default: the bot
 # learns from use and the person can switch it off. What it learns is COUNTERS - never a
@@ -6215,6 +6581,82 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             ans = _CALC_RE.sub("", ans or "")
             _t3 = time.monotonic()
 
+            # ---- FREE BOOKS ------------------------------------------------------
+            # No command and no keyword: the model marks the intent with [book: ...], and a
+            # plain-language safety net catches the case where it forgets the tag.
+            if BOOKS_ENABLED and ans:
+                _bm = _BOOK_TAG_RE.search(ans or "")
+                _bq = ""
+                if _bm:
+                    _bq = _bm.group(1).strip()
+                    ans = _BOOK_TAG_RE.sub("", ans or "").strip()
+                    if "[file:" in (ans or "").lower():
+                        # The model tried to write the book itself. A real file beats a
+                        # fabricated one, so its invented "book" is dropped here.
+                        ans = _FILE_BLOCK_RE.sub("", ans or "").strip()
+                elif (_BOOK_WANT_RE.search(text or "")
+                      and "[file:" not in (ans or "").lower()
+                      and not _file_requested(text or "")):
+                    _bq = _book_query(text or "")
+                if _bq:
+                    if not action_allowed(chat_id, "file"):
+                        ans = ((ans or "").strip() + "\n\n" +
+                               _msg(lang, en="I can send a book, but this chat has hit its "
+                                             "file limit for today.",
+                                    hi="किताब भेज सकता हूँ, पर इस चैट की आज की फ़ाइल सीमा "
+                                       "पूरी हो गई है।",
+                                    hinglish="Book bhej sakta hoon, par is chat ki aaj ki "
+                                             "file limit poori ho gayi hai.")).strip()
+                    else:
+                        await _kick_typing(c.bot, chat_id)
+                        _lang_code = {"english": "en", "hinglish": "en",
+                                      "hindi": "hi"}.get(lang, "en")
+                        _books = await _book_search(_bq, _lang_code)
+                        _sent_book = False
+                        _want_pdf_book = bool(re.search(r"(?i)\bpdf\b", text or ""))
+                        for _bk in _books[:3]:
+                            _fname, _fdata, _why = await _book_download(_bk, _want_pdf_book)
+                            if not _fdata:
+                                log.info("book %r not downloadable: %s",
+                                         _bk.get("title", "")[:40], _why)
+                                continue
+                            _src = ("archive.org" if _bk.get("archive_id")
+                                    else "Project Gutenberg")
+                            _cap = ("📚 " + (_bk.get("title") or "Book")[:120] +
+                                    ((" — " + (_bk.get("authors") or "")) if _bk.get("authors")
+                                     else "") +
+                                    "\n" + _src + " · public domain · text se banaya gaya "
+                                    "PDF (koi temp file save nahi hoti)")
+                            if await _send_book(c.bot, chat_id, _fname, _fdata, _cap):
+                                ans = _msg(lang,
+                                           en=("Here it is: " + _fname + ". Public domain, "
+                                               "from Project Gutenberg."),
+                                           hi=("यह रही: " + _fname + ". Project Gutenberg से, "
+                                               "पब्लिक डोमेन।"),
+                                           hinglish=("Ye lo: " + _fname + ". Project Gutenberg "
+                                                     "se, public domain."))
+                                _sent_book = True
+                                _signal(u.effective_user.id, "book_sent")
+                                break
+                        if not _sent_book:
+                            _ol = ("https://openlibrary.org/search?q=" +
+                                   urllib.parse.quote(_bq[:80]))
+                            _signal(u.effective_user.id, "book_miss")
+                            ans = _msg(lang,
+                                       en=("\"" + _bq[:60] + "\" is not in the free "
+                                           "public-domain catalogue I can legally send. "
+                                           "Legal places to get it: " + _ol +
+                                           " (borrow) or the publisher. If it is an older "
+                                           "classic, give me the author and I will look again."),
+                                       hi=("\"" + _bq[:60] + "\" मुफ़्त पब्लिक-डोमेन सूची में "
+                                           "नहीं है, जिसे मैं कानूनी रूप से भेज सकूँ। कानूनी "
+                                           "विकल्प: " + _ol + " (उधार) या प्रकाशक।"),
+                                       hinglish=("\"" + _bq[:60] + "\" free public-domain "
+                                                 "list me nahi hai, jo main legally bhej sakoon. "
+                                                 "Legal option: " + _ol + " (borrow) ya "
+                                                 "publisher. Purani classic ho to author batao, "
+                                                 "dobara dekh leta hoon."))
+
             # ---- HUMOUR VERIFIER -------------------------------------------------
             # Code has the last word on a joke turn (see _humour_reply_ok).
             if _humour and ans and "[file:" not in (ans or "").lower():
@@ -7482,6 +7924,56 @@ def _ddg_lite_lines(html: str, n: int) -> list:
     return out
 
 
+async def _mojeek_html(query: str, n: int = 5) -> str:
+    """Mojeek's search page. Keyless, and it runs its OWN crawler.
+
+    DuckDuckGo has no search API at all: its HTML endpoints answer automated clients with an
+    HTTP 202 "anomaly" page, which is why lookups used to come back empty. Mojeek indexes
+    independently, so it is the honest second engine instead of another scraper of the same
+    upstream. Empty string on any failure - the caller falls through.
+    """
+    if not query:
+        return ""
+    try:
+        r = await HTTP.get("https://www.mojeek.com/search", params={"q": query},
+                           headers={"User-Agent": _UA_WEB,
+                                    "Accept-Language": "en-US,en;q=0.9",
+                                    "Accept": "text/html"}, timeout=15)
+        if r.status_code != 200:
+            log.info("mojeek HTTP %s for %r", r.status_code, query[:40])
+            return ""
+        return r.text or ""
+    except Exception as e:  # noqa: BLE001
+        log.info("mojeek failed for %r: %s", query[:40], str(e)[:90])
+        return ""
+
+
+def _mojeek_lines(html: str, n: int) -> list:
+    """Parse Mojeek's results into the same "- title: snippet" lines DDG produces. Pure."""
+    out = []
+    for m in re.finditer(
+            r'<a[^>]+class="title"[^>]+href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="title"|\Z)',
+            html or "", re.S | re.I):
+        url, title, rest = m.group(1), _strip_html(m.group(2)), m.group(3)
+        if not title:
+            continue
+        snip = ""
+        ms = re.search(r'<p class="s">(.*?)</p>', rest, re.S | re.I)
+        if ms:
+            snip = _strip_html(ms.group(1))
+        out.append(f"- {title}: {snip[:260]} ({url[:120]})")
+        if len(out) >= n:
+            break
+    if not out:
+        # Older/newer markup: the snippet class has changed shape before.
+        for m in re.finditer(r'<h2><a[^>]+href="([^"]+)"[^>]*>(.*?)</a></h2>', html or "",
+                             re.S | re.I):
+            out.append(f"- {_strip_html(m.group(2))} ({m.group(1)[:120]})")
+            if len(out) >= n:
+                break
+    return out
+
+
 async def _wikipedia(query: str, n: int = 3) -> list:
     """Wikipedia's public API - keyless and reliable, but needs the descriptive UA above."""
     r = await HTTP.get("https://en.wikipedia.org/w/api.php",
@@ -8024,26 +8516,114 @@ def _yt_unescape(s: str) -> str:
             .replace('\\"', '"').replace("\\u0026", "&").strip())
 
 
-# YouTube's public web key. It is the key the youtube.com page itself ships in its own
-# HTML - not a secret, not an account, and it is what every keyless reader uses.
-_YT_WEBKEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-_YT_CTX = {"client": {"clientName": "WEB", "clientVersion": "2.20240726.00.00",
-                      "hl": "en", "gl": "US"}}
+# YouTube's InnerTube endpoints no longer accept the old public web key: a request that
+# still sends ?key=... gets HTTP 400 and every caller then reports "views not available".
+# The key is not needed - the CLIENT CONTEXT is. ANDROID is tried first because it is the
+# client that still answers metadata and captions without a PO token; WEB is the fallback.
+_YT_CLIENTS = (
+    {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38",
+                "androidSdkVersion": 30, "hl": "en", "gl": "US"}},
+    {"client": {"clientName": "WEB", "clientVersion": "2.20240726.00.00",
+                "hl": "en", "gl": "US"}},
+)
+# One breaker PER ENDPOINT FAMILY. YouTube blocks its endpoints independently, so a 429 on
+# captions must not stop metadata - the old single global flag did exactly that, which is
+# why "views" vanished for videos that were fine.
+_YT_BREAKERS: dict = {}
+_YT_FAMILY_SECONDS = float(os.environ.get("YT_BLOCK_SECONDS", "300") or "300")
+
+
+def _yt_open(family: str) -> bool:
+    return time.time() >= _YT_BREAKERS.get(family, 0.0)
+
+
+def _yt_trip(family: str) -> None:
+    _YT_BREAKERS[family] = time.time() + _YT_FAMILY_SECONDS
+    log.warning("yt: %s endpoint blocked - pausing it for %ss", family,
+                int(_YT_FAMILY_SECONDS))
+
+
+async def _yt_innertube(family: str, path: str, payload: dict) -> dict:
+    """POST to an InnerTube endpoint with no API key. {} on block, never raises."""
+    if not _yt_open(family):
+        return {}
+    for ctx in _YT_CLIENTS:
+        try:
+            r = await HTTP.post(
+                "https://www.youtube.com/youtubei/v1/" + path,
+                json=dict(payload, context=ctx),
+                headers={"User-Agent": _UA_WEB, "Content-Type": "application/json",
+                         "Accept-Language": "en-US,en;q=0.9"}, timeout=12)
+            if r.status_code in (403, 429):
+                _yt_trip(family)
+                return {}
+            if r.status_code != 200:
+                continue
+            return r.json() or {}
+        except Exception as e:  # noqa: BLE001
+            log.debug("yt %s (%s) failed: %s", path, ctx["client"]["clientName"],
+                      str(e)[:80])
+    return {}
 
 
 async def _yt_player(vid: str) -> dict:
-    """videoDetails from YouTube's own player endpoint: title, views, description, thumb."""
-    try:
-        r = await HTTP.post(
-            "https://www.youtube.com/youtubei/v1/player?key=" + _YT_WEBKEY,
-            json={"context": _YT_CTX, "videoId": vid},
-            headers={"User-Agent": _UA_WEB, "Content-Type": "application/json"}, timeout=12)
-        if r.status_code != 200:
-            return {}
-        return (r.json() or {}).get("videoDetails") or {}
-    except Exception as e:  # noqa: BLE001
-        log.debug("yt player failed: %s", str(e)[:90])
+    """videoDetails from the player endpoint: title, views, description, thumb."""
+    j = await _yt_innertube("player", "player", {"videoId": vid})
+    return (j or {}).get("videoDetails") or {}
+
+
+def _yt_walk(node, key: str, out: list, limit: int = 1) -> None:
+    """Collect every dict stored under `key` anywhere in a JSON tree. Pure."""
+    if len(out) >= limit:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key and isinstance(v, dict):
+                out.append(v)
+                if len(out) >= limit:
+                    return
+            _yt_walk(v, key, out, limit)
+    elif isinstance(node, list):
+        for v in node:
+            _yt_walk(v, key, out, limit)
+
+
+async def _yt_next_meta(vid: str) -> dict:
+    """Views, publish date and channel from the WATCH page's own data (`next`).
+
+    This is the path that keeps working when the player endpoint answers
+    "Sign in to confirm you're not a bot" - the reason view counts were showing as
+    unavailable on datacenter IPs.
+    """
+    j = await _yt_innertube("next", "next", {"videoId": vid})
+    if not j:
         return {}
+    found: list = []
+    _yt_walk(j, "videoPrimaryInfoRenderer", found, 1)
+    out = {}
+    if found:
+        pri = found[0]
+        title = pri.get("title") or {}
+        runs = title.get("runs") or []
+        if runs:
+            out["title"] = _yt_unescape(runs[0].get("text") or "")
+        vc = ((pri.get("viewCount") or {}).get("videoViewCountRenderer") or {})
+        v = (vc.get("viewCount") or {}).get("simpleText") or ""
+        if v:
+            out["views"] = _yt_unescape(v)
+        elif (vc.get("viewCount") or {}).get("runs"):
+            out["views"] = _yt_unescape(
+                "".join(r.get("text") or "" for r in vc["viewCount"]["runs"]))
+        d = (pri.get("dateText") or {}).get("simpleText") or ""
+        if d:
+            out["published"] = _yt_unescape(d)
+    found2: list = []
+    _yt_walk(j, "videoOwnerRenderer", found2, 1)
+    if found2:
+        runs = ((found2[0].get("title") or {}).get("runs") or [])
+        if runs:
+            out["author"] = _yt_unescape(runs[0].get("text") or "")
+    return out
 
 
 async def _yt_comments(page: str, want: int = 6) -> list:
@@ -8055,15 +8635,11 @@ async def _yt_comments(page: str, want: int = 6) -> list:
         return []
     for tok in tokens[:3]:
         try:
-            r = await HTTP.post(
-                "https://www.youtube.com/youtubei/v1/next?key=" + _YT_WEBKEY,
-                json={"context": _YT_CTX, "continuation": tok},
-                headers={"User-Agent": _UA_WEB, "Content-Type": "application/json"},
-                timeout=12)
-            if r.status_code != 200:
+            _cj = await _yt_innertube("next", "next", {"continuation": tok})
+            if not _cj:
                 continue
             found: list = []
-            _find_key(r.json(), "commentEntityPayload", found)
+            _find_key(_cj, "commentEntityPayload", found)
             out = []
             for item in found[:want]:
                 props = item.get("properties") or {}
@@ -8080,15 +8656,14 @@ async def _yt_comments(page: str, want: int = 6) -> list:
 
 _YT_CACHE: dict = {}            # video id -> (epoch, text)
 _YT_TTL = float(os.environ.get("YT_CACHE_TTL", "1800") or "1800")
-_YT_BLOCKED_UNTIL = 0.0
-YT_BLOCK_SECONDS = float(os.environ.get("YT_BLOCK_SECONDS", "300") or "300")
+_YT_BLOCKED_UNTIL = 0.0        # kept for older references; per-family breakers are live
+YT_BLOCK_SECONDS = _YT_FAMILY_SECONDS
 
 
 async def _youtube_context(url: str, chat_id: int = 0) -> str:
     """What a YouTube video IS - title, channel, views, description, thumbnail, captions,
     and the top comments. The thumbnail is handed to the model as an image, so it can talk
     about what the video actually looks like instead of guessing from the title."""
-    global _YT_BLOCKED_UNTIL
     vid = _yt_video_id(url)
     if not vid:
         return ""
@@ -8100,12 +8675,12 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             if _mt:
                 await _stash_link_image(chat_id, _mt.group(1), "YouTube thumbnail")
         return _hit[1]
-    if time.time() < _YT_BLOCKED_UNTIL:
-        log.info("yt: still inside the 429 back-off window for %s", vid)
+    if not (_yt_open("player") or _yt_open("next")):
+        log.info("yt: both metadata endpoints are paused for %s", vid)
         return ("YouTube video: " + vid +
-                "\nviews: NOT AVAILABLE - YouTube is rate-limiting this server (HTTP 429). "
-                "Tell the person plainly that YouTube did not return the data this time "
-                "and to try again in a few minutes. Do NOT guess a number.")
+                "\nviews: NOT AVAILABLE - YouTube is rate-limiting this server. Tell the "
+                "person plainly that YouTube did not return the data this time and to try "
+                "again in a few minutes. Do NOT guess a number.")
     canon = "https://www.youtube.com/watch?v=" + vid
     title = author = desc = transcript = ""
     views = published = thumb = ""
@@ -8133,6 +8708,17 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
         thumbs = ((vd.get("thumbnail") or {}).get("thumbnails") or [])
         if thumbs:
             thumb = (thumbs[-1] or {}).get("url") or ""
+    # 2b. The player endpoint is routinely refused on a datacenter IP ("Sign in to confirm
+    #     you're not a bot"). The watch page's own data still carries the view count, so it
+    #     is asked BEFORE scraping HTML - that is what was making views show as missing.
+    if not views:
+        nm = await _yt_next_meta(vid)
+        if nm:
+            title = title or nm.get("title", "")
+            author = author or nm.get("author", "")
+            views = nm.get("views", "") or views
+            published = published or nm.get("published", "")
+            log.info("yt: metadata from next for %s (views=%s)", vid, views or "none")
     # 3. The public watch page carries the caption track and the comment token.
     page = ""
     try:
@@ -8157,9 +8743,8 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             page = page or body_txt          # keep something, keep trying
         if page and "viewCount" not in page and "captionTracks" not in page:
             log.info("yt: every page shape came back gated for %s", vid)
-        if getattr(r, "status_code", 0) == 429 or not page:
-            _YT_BLOCKED_UNTIL = time.time() + YT_BLOCK_SECONDS
-            log.warning("yt: rate-limited - backing off for %ss", int(YT_BLOCK_SECONDS))
+        if getattr(r, "status_code", 0) == 429:
+            _yt_trip("page")
         if not thumb:
             mt = re.search(r'"thumbnailUrl":\["([^"]+)"', page or "")
             if mt:
@@ -8882,6 +9467,15 @@ async def _web_lookup(query: str, n: int, deep: bool, use_wiki: bool = True) -> 
     lines = _ddg_lite_lines(html, n) if html else []
     if lines:
         log.info("research via ddg lite -> %s results", len(lines))
+    if not lines:
+        # DDG is a scraper of somebody else's engine and answers bots with a CAPTCHA page;
+        # Mojeek runs its own index, so it is asked before falling back to encyclopedias.
+        _mj = await _mojeek_html(query, n)
+        _mlines = _mojeek_lines(_mj, n) if _mj else []
+        if _mlines:
+            lines = _mlines
+            log.info("research via mojeek -> %s results", len(_mlines))
+            html = _mj
     if not lines and use_wiki:
         for fn in (_wikipedia, _ddg_instant):
             try:

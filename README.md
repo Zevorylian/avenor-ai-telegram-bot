@@ -19,7 +19,13 @@ and in a group when it is mentioned or replied to. It mirrors Hindi, Hinglish or
 message itself, and it never introduces itself or repeats the question back. If a message is aimed at
 someone else, it stays quiet.
 
-**Reads the live web.** A factual question triggers a real lookup — DuckDuckGo, Wikipedia, Google News,
+**YouTube without an API key.** Metadata comes from oEmbed, then the keyless InnerTube player,
+then the watch page's own `next` data — which is what keeps the view count working when the player
+endpoint answers "Sign in to confirm you're not a bot" from a datacenter IP. Each endpoint has its
+own circuit breaker, so a caption block never hides a view count.
+
+**Reads the live web.** A factual question triggers a real lookup — DuckDuckGo, then **Mojeek**
+(its own crawler, so a DuckDuckGo CAPTCHA no longer means "no results"), Wikipedia, Google News,
 arXiv — and the answer is built from what came back, with the sources named. If a model ever claims it
 has no internet access, the reply is discarded and rebuilt from the fetched data.
 
@@ -28,6 +34,19 @@ SQL, YAML — and `.pdf`, written by a small PDF writer inside the bot, so "make
 document you can open, not text with a `.pdf` name. One reply can carry up to six files and they arrive
 as a single album, so "make a website" produces `index.html` + `style.css` + `app.js` instead of one
 1,500-line page. A reply that promises a file always carries one.
+
+**Sends real books, rebuilt as one clean PDF.** Ask in plain words — *"mujhe Frankenstein
+chahiye"* — and the bot searches Project Gutenberg (Gutendex, no key, 70k+ titles), then
+gutenberg.org's own search, then **archive.org** (its `_djvu.txt` OCR text). It downloads the
+source **in memory only**, takes the text out (EPUB → XHTML → text, or TXT/HTML), throws the
+download away, and writes **one new PDF** with its own writer. Nothing is ever saved to disk, so
+there is no temp file to clean up. No command, no keyword: the intent comes from the message.
+
+The model is explicitly told **not** to write the book itself — a fabricated book is worse than
+no book. If the text is Devanagari/Tamil/Bengali the PDF writer cannot draw it (Latin-1 only), so
+the readable TXT is sent instead of a PDF full of question marks. A title that is still in
+copyright gets an honest line and a legal link (Open Library / publisher) — shadow libraries are
+deliberately not wired in.
 
 **Reads links, images and documents.** YouTube (title, views, comments, thumbnail — the thumbnail is
 passed to the model as an image), Instagram, X/Twitter, Reddit, GitHub, and any ordinary page. Photos
