@@ -19,10 +19,15 @@ and in a group when it is mentioned or replied to. It mirrors Hindi, Hinglish or
 message itself, and it never introduces itself or repeats the question back. If a message is aimed at
 someone else, it stays quiet.
 
-**YouTube without an API key.** Metadata comes from oEmbed, then the keyless InnerTube player,
-then the watch page's own `next` data — which is what keeps the view count working when the player
-endpoint answers "Sign in to confirm you're not a bot" from a datacenter IP. Each endpoint has its
-own circuit breaker, so a caption block never hides a view count.
+**YouTube views and comments, reliably.** The order is: the official **YouTube Data API v3**
+(`YOUTUBE_API_KEY`, free 10,000 units/day, one video = 1 unit) → keyless Piped mirrors → oEmbed
+(title/channel/thumbnail, never blocked) → the keyless InnerTube player → the watch page's own
+`next` data. Scraping works from a home IP and gets refused from a datacenter IP, which is exactly
+where a bot runs, so the API key is the real fix and the mirrors are the no-key fallback. Each
+endpoint has its own circuit breaker, so one block never hides another source.
+
+When something genuinely is not available, the bot says it **once**: the facts block carries a
+single `missing:` line instead of one excuse per field.
 
 **Reads the live web.** A factual question triggers a real lookup — DuckDuckGo, then **Mojeek**
 (its own crawler, so a DuckDuckGo CAPTCHA no longer means "no results"), Wikipedia, Google News,

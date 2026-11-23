@@ -8843,6 +8843,83 @@ async def _yt_innertube(family: str, path: str, payload: dict) -> dict:
     return {}
 
 
+# Views and comments have ONE reliable source: YouTube's own Data API v3, free (10,000 units
+# a day, one video lookup costs 1). Scraping InnerTube works from a home IP and fails from a
+# datacenter IP - which is exactly where this bot runs - so the key is the real fix, and the
+# keyless Piped mirrors below are the fallback for people who do not want a key.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+YT_PIPED_INSTANCES = [u.strip().rstrip("/") for u in os.environ.get(
+    "YT_PIPED_INSTANCES",
+    "https://pipedapi.kavin.rocks,https://pipedapi.adminforge.de").split(",") if u.strip()]
+
+
+def _fmt_count(v) -> str:
+    """'1234567' -> '1,234,567'. Pure."""
+    try:
+        return f"{int(v):,}"
+    except Exception:  # noqa: BLE001
+        return str(v or "")
+
+
+async def _yt_api_meta(vid: str) -> dict:
+    """Official YouTube Data API v3: title, channel, views, likes, comments, date, text."""
+    if not YOUTUBE_API_KEY:
+        return {}
+    try:
+        r = await HTTP.get("https://www.googleapis.com/youtube/v3/videos",
+                           params={"part": "snippet,statistics", "id": vid,
+                                   "key": YOUTUBE_API_KEY},
+                           timeout=12, headers={"Accept": "application/json"})
+        if r.status_code != 200:
+            log.info("yt api HTTP %s", r.status_code)
+            return {}
+        items = (r.json() or {}).get("items") or []
+        if not items:
+            return {}
+        it = items[0]
+        sn = it.get("snippet") or {}
+        st = it.get("statistics") or {}
+        return {
+            "title": sn.get("title") or "",
+            "author": sn.get("channelTitle") or "",
+            "views": _fmt_count(st.get("viewCount")),
+            "likes": _fmt_count(st.get("likeCount")),
+            "comments": _fmt_count(st.get("commentCount")),
+            "published": (sn.get("publishedAt") or "")[:10],
+            "desc": sn.get("description") or "",
+        }
+    except Exception as e:  # noqa: BLE001
+        log.info("yt api failed: %s", str(e)[:90])
+        return {}
+
+
+async def _yt_piped_meta(vid: str) -> dict:
+    """Keyless fallback: a Piped/Invidious-style mirror that returns views as JSON."""
+    for base in YT_PIPED_INSTANCES[:3]:
+        try:
+            r = await HTTP.get(f"{base}/streams/{vid}", timeout=8,
+                               headers={"Accept": "application/json"})
+            if r.status_code != 200:
+                continue
+            j = r.json() or {}
+            if not j.get("title"):
+                continue
+            log.info("yt meta via %s", base)
+            return {
+                "title": j.get("title") or "",
+                "author": j.get("uploader") or "",
+                "views": _fmt_count(j.get("views")) if j.get("views") is not None else "",
+                "likes": _fmt_count(j.get("likes")) if j.get("likes") is not None else "",
+                "comments": (_fmt_count(j.get("comments"))
+                             if j.get("comments") is not None else ""),
+                "published": (j.get("uploadDate") or "")[:10],
+                "desc": j.get("description") or "",
+            }
+        except Exception as e:  # noqa: BLE001
+            log.debug("piped %s failed: %s", base[:40], str(e)[:60])
+    return {}
+
+
 async def _yt_player(vid: str) -> dict:
     """videoDetails from the player endpoint: title, views, description, thumb."""
     j = await _yt_innertube("player", "player", {"videoId": vid})
@@ -8952,12 +9029,9 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             if _mt:
                 await _stash_link_image(chat_id, _mt.group(1), "YouTube thumbnail")
         return _hit[1]
-    if not (_yt_open("player") or _yt_open("next")):
-        log.info("yt: both metadata endpoints are paused for %s", vid)
-        return ("YouTube video: " + vid +
-                "\nviews: NOT AVAILABLE - YouTube is rate-limiting this server. Tell the "
-                "person plainly that YouTube did not return the data this time and to try "
-                "again in a few minutes. Do NOT guess a number.")
+    # NOTE: there used to be an early return here when both scraping endpoints were paused.
+    # It fired BEFORE oEmbed and before the official API were even tried, so a single 403
+    # made every later video look broken. The order below handles it properly instead.
     canon = "https://www.youtube.com/watch?v=" + vid
     title = author = desc = transcript = ""
     views = published = thumb = ""
@@ -8974,8 +9048,22 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             author = j.get("author_name") or ""
     except Exception as e:  # noqa: BLE001
         log.debug("yt oembed failed: %s", str(e)[:80])
-    # 2. The player endpoint: exact view count, publish date and the thumbnail list.
-    vd = await _yt_player(vid)
+    # 2. The reliable sources first: the official API (if a key is set), then a keyless
+    #    mirror. Only if both fail does the scraping chain below get a turn.
+    likes = ""
+    _meta = await _yt_api_meta(vid)
+    if not _meta:
+        _meta = await _yt_piped_meta(vid)
+    if _meta:
+        title = title or _meta.get("title", "")
+        author = author or _meta.get("author", "")
+        views = _meta.get("views") or views
+        likes = _meta.get("likes") or ""
+        comment_total = _meta.get("comments") or comment_total
+        published = published or _meta.get("published", "")
+        desc = desc or _meta.get("desc", "")
+    # 3. The player endpoint: exact view count, publish date and the thumbnail list.
+    vd = await _yt_player(vid) if (not views and _yt_open("player")) else {}
     if vd:
         title = title or (vd.get("title") or "")
         author = author or (vd.get("author") or "")
@@ -8996,11 +9084,14 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             views = nm.get("views", "") or views
             published = published or nm.get("published", "")
             log.info("yt: metadata from next for %s (views=%s)", vid, views or "none")
-    # 3. The public watch page carries the caption track and the comment token.
+    # 4. The public watch page carries the caption track and the comment token.
     page = ""
+    if not _yt_open("page"):
+        log.info("yt: page endpoint paused - skipping the scrape for %s", vid)
     try:
-        _yt_page_urls = [canon, canon + "&has_verified=1",
-                         "https://m.youtube.com/watch?v=" + vid]
+        _yt_page_urls = [] if not _yt_open("page") else [
+            canon, canon + "&has_verified=1",
+            "https://m.youtube.com/watch?v=" + vid]
         for _pu in _yt_page_urls:
             try:
                 r = await HTTP.get(_pu, headers={"User-Agent": _UA_WEB,
@@ -9093,15 +9184,22 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     out.append("title: " + (title or vid))
     if author:
         out.append("channel: " + author)
-    out.append("views: " + (views or "unavailable"))
+    if views:
+        out.append("views: " + views)
+    if likes:
+        out.append("likes: " + likes)
     if published:
         out.append("published: " + published)
     if comment_total:
         out.append("total comments: " + comment_total)
     elif comments:
-        out.append(f"comments read: {len(comments)} (the page published no total)")
-    else:
-        out.append("comments: unavailable")
+        out.append(f"comments read: {len(comments)} (no public total)")
+    _missing = [n for n, v in (("views", views), ("comments", comment_total or comments))
+                if not v]
+    if _missing:
+        # ONE line, not one per field: the reply used to repeat "YouTube ne nahi bataye"
+        # twice because views and comments each printed their own excuse.
+        out.append("missing: " + ", ".join(_missing))
     if thumb:
         out.append("thumbnail: " + thumb + " - the image itself is attached to you; "
                    "look at it and describe what is actually on screen")
@@ -9113,9 +9211,10 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     if comments:
         out.append("top comments (public):\n" + "\n".join(comments))
     # ONE guidance line, outside the values, so nothing in a value can be copied out.
-    out.append("NOTE (not part of the data): answer in the user's language. If a value "
-               "says unavailable, say in ONE short sentence that YouTube did not return "
-               "it this time - never guess a number, and never paste this block.")
+    out.append("NOTE (not part of the data): answer in the user's language. If a 'missing' "
+               "line exists, mention it ONCE in one short sentence and move on - never "
+               "guess a number, never repeat the same excuse for each field, and never "
+               "paste this block.")
     result = "\n".join(out)
     if views or comments or comment_total:
         _YT_CACHE[vid] = (time.time(), result)      # only cache a result that HAS data
@@ -11289,6 +11388,9 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              "🌐 Pollinations text fallback: "
              + ("ON (opt-in)" if POLLINATIONS_TEXT_ENABLED else "off (opt-in only)"),
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
+             "🎬 YouTube: " + ("Data API key set (official views/comments)"
+                              if YOUTUBE_API_KEY else
+                              f"no API key - {len(YT_PIPED_INSTANCES)} keyless mirror(s) + scrape"),
              f"🔊 TTS: {'on' if client is not None else 'off'} "
              f"(voice: {_chat_voice(u.effective_chat.id)})",
              f"🎙 ffmpeg: {'yes' if _ffmpeg_exe() else 'no (voice sent as audio)'}",
