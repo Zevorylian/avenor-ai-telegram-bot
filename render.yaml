@@ -7,6 +7,25 @@ services:
     startCommand: python bot.py
     healthCheckPath: /health
     autoDeploy: true
+    # ------------------------------------------------------------------
+    # DURABILITY. This service keeps users, notes and reminders in a JSON file
+    # (MEMORY_FILE). Render's filesystem is EPHEMERAL on the free plan, so that
+    # file is deleted on every deploy, restart and spin-down - the bot comes back
+    # with no memory and no reminders. A disk fixes it, and a disk requires a
+    # paid instance type, so it is left commented out rather than silently
+    # breaking `render.yaml` on the free plan:
+    #
+    # plan: starter
+    # disk:
+    #   name: avenor-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    #
+    # then set MEMORY_FILE=/var/data/avenor_memory.json in envVars below.
+    # Without a disk, point MEMORY_FILE at an external volume or move the
+    # store to a database. /status now reports memory.dir_writable and
+    # memory.last_save_s_ago so this is visible instead of silent.
+    # ------------------------------------------------------------------
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
@@ -24,3 +43,11 @@ services:
         sync: false
       - key: GITHUB_TOKEN
         sync: false
+      - key: MEMORY_FILE
+        sync: false
+      # Opt-in on purpose: this sends user text to a third party.
+      - key: POLLINATIONS_TEXT_ENABLED
+        value: "false"
+      # Join welcomes go to this group only; channels never get one.
+      - key: WELCOME_CHATS
+        value: avenorclub
