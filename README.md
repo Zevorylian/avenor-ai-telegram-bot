@@ -5,7 +5,8 @@ files (HTML, PDF, CSV, code) and improves its own source code — with the owner
 change. One bot file plus a prompt module, one JSON store, no database to run.
 
 - **Bot:** [@AvenorAIBot](https://t.me/AvenorAIBot)
-- **Group:** [Avenor AI Community](https://t.me/AvenorAICommunity)
+- **Group:** [Avenor Club](https://t.me/AvenorClub)
+- **Channels:** [Avenor Lab](https://t.me/AvenorLab) · [Avenor Feed](https://t.me/AvenorFeed)
 - **Repository:** [github.com/Zevorylian/avenor-ai-telegram-bot](https://github.com/Zevorylian/avenor-ai-telegram-bot)
 - **Developer:** Deepak Danodia — [@Zevorylian](https://github.com/Zevorylian)
 - **Licence:** MIT — see [LICENSE](LICENSE)
@@ -14,10 +15,11 @@ change. One bot file plus a prompt module, one JSON store, no database to run.
 
 ## What it does
 
-**Talks like a person, in the person's language.** Replies to any private message without a command,
-and in a group when it is mentioned or replied to. It mirrors Hindi, Hinglish or English from the
-message itself, and it never introduces itself or repeats the question back. If a message is aimed at
-someone else, it stays quiet.
+**Talks like a person, in the person's language.** Replies to any private message without a command.
+In a group it answers **every** message by default; set `GROUP_MODE=mention` to make it answer only
+when it is @mentioned or replied to. It mirrors Hindi, Hinglish or English from the message itself,
+and it never introduces itself or repeats the question back. If a message is aimed at someone else,
+it stays quiet.
 
 **YouTube views and comments, reliably.** The order is: the official **YouTube Data API v3**
 (`YOUTUBE_API_KEY`, free 10,000 units/day, one video = 1 unit) → keyless Piped mirrors → oEmbed
@@ -200,8 +202,8 @@ plus `/join` and `/speak` when voice is on.
 
 | List | Behaviour | Default channels |
 |---|---|---|
-| `DISCORD_AUTO_CHANNELS` | answers every message — no @mention, no command | ai-chat, research-lab, image-studio, file-desk, coding-lab, voice-lab, voice-control |
-| `DISCORD_MENTION_CHANNELS` | answers only on @Avenor or `/ask` | general, suggestions, bug-reports, introductions, showcase, how-to-use-avenor |
+| `DISCORD_AUTO_CHANNELS` | answers every message — no @mention, no command | ai-chat, research-lab, image-studio, file-desk, coding-lab, voice-lab, voice-control, tile-desk, ask-avenor, bot-testing |
+| `DISCORD_MENTION_CHANNELS` | answers only on @Avenor or `/ask` | general, suggestions, bug-reports, introductions, showcase, how-to-use-avenor, memory-guide, announcements, welcome |
 | `DISCORD_IGNORE_CHANNELS` | never answers, not even when mentioned | admin, admin-room, mod-log, bot-logs, logs, rules |
 
 A channel in none of the lists answers freely, so the bot is never mysteriously silent. An
@@ -299,6 +301,21 @@ Turn either off with `/privacy`, or in plain words: *"mera data use mat karo"*. 
 name or ID is stored with a counter. Full detail in [privacy-policy.md](privacy-policy.md).
 
 ---
+
+## Telegram channels and group
+
+Three chats, three different jobs:
+
+| Chat | Type | What the bot does there |
+|---|---|---|
+| [Avenor Club](https://t.me/AvenorClub) | group | join welcome, answers, polls |
+| [Avenor Lab](https://t.me/AvenorLab) | channel | posts only |
+| [Avenor Feed](https://t.me/AvenorFeed) | channel | posts only |
+
+A **join welcome is sent to the group only**. It never fires in a channel: a channel post is public,
+so a welcome card there is spam for every other subscriber, and repeated membership changes made it
+repeat. `WELCOME_CHATS` (default `avenorclub`) decides which groups are eligible; a channel is
+excluded before that list is even read.
 
 ## Group safety
 

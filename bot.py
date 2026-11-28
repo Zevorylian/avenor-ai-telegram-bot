@@ -36,8 +36,9 @@ Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chai
   BOT_TOKEN          (required)  BotFather token
   GEMINI_API_KEY     (required)  Google AI Studio free key
   GEMINI_MODELS      (optional)  ordered by free daily quota; built-in default:
-                                 gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3-flash-preview,
-                                 gemma-4-31b-it, gemini-3.6-flash
+                                 gemma-4-26b-a4b-it, gemma-4-31b-it, gemini-3.1-flash-lite,
+                                 gemini-3.5-flash-lite, gemini-3-flash-preview, gemini-3.6-flash,
+                                 gemini-3.8-flash
   GROQ_API_KEY       (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
   GROQ_MODELS        (optional)  default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b
   TTS_MODELS         (optional)  default: gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts
@@ -159,31 +160,30 @@ GEMINI_MODELS_FROM_ENV = bool(_models_env)
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
     "gemma-4-26b-a4b-it",      # 30 RPM
     "gemma-4-31b-it",          # 30 RPM
-    "gemini-2.5-flash-lite",   # 10 RPM
     "gemini-3.1-flash-lite",   # 15 RPM
     "gemini-3.5-flash-lite",   # 15 RPM
-    "gemini-2.5-flash",        # 5 RPM
     "gemini-3-flash-preview",  # 5 RPM
     "gemini-3.6-flash",        # 5 RPM
     "gemini-3.8-flash",        # 5 RPM - best quality, scarcest
 ]
-# Requests-per-minute per model, for /diag and for the ordering above. Free tier, measured
-# on this project's own AI Studio page.
+# gemini-2.5-flash and gemini-2.5-flash-lite were removed on purpose. Google's model page
+# (checked 2026-11-28) marks 2.5-flash deprecated and states that from 1 Dec 2026 every
+# request to it is auto-routed to gemini-3.5-flash-lite - which is already in this chain, so
+# keeping 2.5-flash only duplicated a model while claiming an RPM that was no longer real.
+# 2.5-flash-lite is restricted to keys that already used it.
 MODEL_RPM = {
     "gemma-4-26b-a4b-it": 30, "gemma-4-31b-it": 30,
     "gemini-3.1-flash-lite": 15, "gemini-3.5-flash-lite": 15,
-    "gemini-2.5-flash-lite": 10,
-    "gemini-2.5-flash": 5, "gemini-3-flash-preview": 5,
+    "gemini-3-flash-preview": 5,
     "gemini-3.6-flash": 5, "gemini-3.8-flash": 5,
 }
-# How many times the WHOLE chain is walked before giving up. "Last one failed too? start
-# again from the first" - a rate limit is per minute, so the second pass often succeeds.
 MODEL_CHAIN_PASSES = max(1, int(os.environ.get("MODEL_CHAIN_PASSES", "2") or "2"))
 # Voice / real-time: these are the Live API models on the same key (unlimited RPM on the
 # free tier, per the same page). Used for the Discord voice channel and any live session.
 GEMINI_LIVE_MODELS = [m.strip() for m in os.environ.get(
     "GEMINI_LIVE_MODELS",
-    "gemini-3.8-live,gemini-3-flash-live,gemini-2.5-flash-native-audio-dialog").split(",")
+    "gemini-3.8-live,gemini-3.1-flash-live-preview,"
+    "gemini-2.5-flash-native-audio-preview-12-2025").split(",")
     if m.strip()]
 
 _tts_env = os.environ.get("TTS_MODELS", "").strip()
@@ -855,7 +855,7 @@ def _short_ctx(context: str, limit: int = 900) -> str:
     return "\n".join(keep)
 
 WELCOME_CAPTION = (
-    "Welcome to Avenor Group, {name}.\n"
+    "Welcome to Avenor Club, {name}.\n"
     "\n"
     "Here is your entry pass:\n"
     "\n"
@@ -924,7 +924,10 @@ IMAGE_RATIOS = {"square": (1, 1), "tall": (2, 3), "portrait": (2, 3),
 # Tertiary, no-key text fallback (used only when Gemini AND Groq both fail).
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_TEXT_MODEL = os.environ.get("POLLINATIONS_TEXT_MODEL", "openai").strip() or "openai"
-POLLINATIONS_TEXT_ENABLED = (os.environ.get("POLLINATIONS_TEXT_ENABLED", "true")
+# OPT-IN, and the default is now false to match what privacy-policy.md and /diag both
+# promise: the operator has to choose to send user text to this third party. It used to
+# default to true, so every install shipped the data flow the policy said it did not.
+POLLINATIONS_TEXT_ENABLED = (os.environ.get("POLLINATIONS_TEXT_ENABLED", "false")
                              .strip().lower() in ("1", "true", "yes", "on"))
 _LAST_IMAGE: dict = {}       # chat_id -> epoch of the last image (cooldown)
 HTTP_IMG = httpx.AsyncClient(timeout=150)
@@ -2100,12 +2103,34 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
 
 
 def _to_groq_messages(contents) -> list:
+    """Text-only view of the conversation for the Groq/Pollinations fallbacks.
+
+    These providers are never sent image, audio or document parts. Those parts used to be
+    dropped in silence while the persona told the model that every attachment was "already
+    read and attached", so a fallback reply described a photo it had never received. The
+    drop is now stated in the prompt, which is the only thing that makes an honest answer
+    possible on this path.
+    """
     msgs = []
+    dropped = 0
     for c in contents:
         role = "assistant" if getattr(c, "role", "user") == "model" else "user"
-        txt = "".join(getattr(p, "text", "") or "" for p in (getattr(c, "parts", None) or []))
+        parts = getattr(c, "parts", None) or []
+        txt = ""
+        for p in parts:
+            t = getattr(p, "text", "") or ""
+            if t:
+                txt += t
+            else:
+                dropped += 1
         if txt:
             msgs.append({"role": role, "content": txt})
+    if dropped and msgs:
+        note = ("[system note: " + str(dropped) + " attachment(s) in this conversation "
+                "(image, audio or document) were NOT delivered to this model. You cannot "
+                "see or hear them. If it matters, say so in one line and ask for a resend; "
+                "never describe or guess their content.]")
+        msgs[-1]["content"] = (msgs[-1]["content"] + "\n\n" + note).strip()
     return msgs
 
 
@@ -5129,6 +5154,11 @@ def _boot_report() -> dict:
         "groq": bool(GROQ_API_KEY),
         "discord": _discord_status_line(),
         "memory_file": getattr(MEM, "MEMORY_FILE", "") if MEM is not None else "",
+        "memory": (MEM.health() if MEM is not None and hasattr(MEM, "health") else {}),
+        "model_chain": list(GEMINI_MODELS),
+        "live_models": list(GEMINI_LIVE_MODELS),
+        "pollinations_text": bool(POLLINATIONS_TEXT_ENABLED),
+        "welcome_chats": sorted(WELCOME_CHATS),
         "uptime_s": int(time.time() - _BOOT_AT),
         "last_error": _LAST_BOOT_ERROR,
         "features": _feature_report(),
@@ -7365,6 +7395,27 @@ async def cmd_welcome(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await send_welcome(c.bot, chat.id, u.effective_user)
 
 
+# Which chat may receive a join welcome. A CHANNEL is excluded unconditionally, before
+# this list is even consulted: a channel post is public, so a welcome card there is spam for
+# every other subscriber, and repeated membership changes made it repeat. Default is the one
+# community group; add ids or @usernames (comma-separated) to widen it.
+WELCOME_CHATS = {c.strip().lower().lstrip("@")
+                 for c in os.environ.get("WELCOME_CHATS", "avenorclub").split(",") if c.strip()}
+
+
+def _welcome_allowed(chat) -> bool:
+    """True only for a group/supergroup named in WELCOME_CHATS. Pure and total."""
+    if chat is None:
+        return False
+    if (getattr(chat, "type", "") or "") == "channel":
+        return False                      # a channel never gets a join welcome
+    keys = {str(getattr(chat, "id", "") or ""),
+            (getattr(chat, "username", "") or "").lower().lstrip("@"),
+            re.sub(r"[^a-z0-9]", "", (getattr(chat, "title", "") or "").lower())}
+    keys.discard("")
+    return bool(keys & WELCOME_CHATS)
+
+
 async def on_chat_member(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     cm = u.chat_member
     if cm is None:
@@ -7377,6 +7428,11 @@ async def on_chat_member(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     for _k in [k for k in _CHAT_INFO if (k[0] if isinstance(k, tuple) else k) == cm.chat.id]:
         _CHAT_INFO.pop(_k, None)          # both the with-IDs and the names-only variant
     if old in ("left", "kicked") and new in ("member", "administrator", "creator", "restricted"):
+        if not _welcome_allowed(cm.chat):
+            log.info("no welcome for %s (%s) - a channel, or not in WELCOME_CHATS",
+                     getattr(cm.chat, "title", "") or getattr(cm.chat, "id", ""),
+                     getattr(cm.chat, "type", ""))
+            return
         log.info("New member: %s (%s) -> sending welcome", member.full_name, member.id)
         await send_welcome(c.bot, cm.chat.id, member)
 
@@ -7524,6 +7580,14 @@ async def _cleanup_once() -> None:
     log.info("cleanup: locks=%s send_times=%s logs=%s actions=%s cache=%s",
              len(TURN_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
              len(_ACTION_LAST), len(_SEARCH_CACHE))
+    # A hard kill (OOM, free-plan spin-down) loses whatever was batched and not yet
+    # written, because save() only debounces and nothing else calls flush(). Hourly is not
+    # perfect, but it bounds the loss without adding a timer per message.
+    if MEM is not None:
+        try:
+            MEM.flush()
+        except Exception as e:  # noqa: BLE001
+            log.warning("periodic memory flush failed: %s", e)
     # Retention purge (the automated job privacy-policy.md promises).
     if MEM is not None and MEMORY_RETENTION_DAYS:
         try:
@@ -11943,6 +12007,14 @@ def resolve_models() -> None:
             log.warning("Dropping unavailable models: %s", ", ".join(bad))
         GEMINI_MODELS = chain
         log.info("Model chain resolved: %s", ", ".join(GEMINI_MODELS))
+        # The live and TTS ids are used by /voice, Discord voice and voice replies, and were
+        # the only model names in this file that nothing ever validated. A warning, not a
+        # drop: models.list is per-key, so a missing id may only mean no access on this key.
+        for _label, _ids in (("live", GEMINI_LIVE_MODELS), ("tts", TTS_MODELS)):
+            _missing = [m for m in _ids if m and m not in names]
+            if _missing:
+                log.warning("%s model ids not listed by this API key: %s",
+                            _label, ", ".join(_missing))
     except Exception as e:  # noqa: BLE001
         log.warning("resolve_models failed (ignored): %s", e)
 

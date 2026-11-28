@@ -185,6 +185,28 @@ def flush() -> None:
     save(force=True)
 
 
+def health() -> dict:
+    """Non-secret facts about the store, for /status and /diag.
+
+    A redeploy on a host with an ephemeral disk silently starts from an empty store, and
+    nothing used to say so. `dir_writable` plus `last_save_s_ago` makes that visible.
+    """
+    load()
+    with _LOCK:
+        path = MEMORY_FILE
+        folder = os.path.dirname(os.path.abspath(path)) or "."
+        return {
+            "file": path,
+            "loaded": bool(_LOADED),
+            "dirty": bool(_DIRTY),
+            "last_save_s_ago": int(time.time() - _LAST_SAVE) if _LAST_SAVE else -1,
+            "dir_writable": os.access(folder, os.W_OK),
+            "users": len(_DATA.get("users") or {}),
+            "chats": len(_DATA.get("chats") or {}),
+            "reminders": len(_DATA.get("reminders") or {}),
+        }
+
+
 def _touch(obj: dict) -> dict:
     obj["last_seen"] = int(time.time())
     obj.setdefault("first_seen", obj["last_seen"])
