@@ -51,3 +51,15 @@ services:
       # Join welcomes go to this group only; channels never get one.
       - key: WELCOME_CHATS
         value: avenorclub
+      # Lab is the source; Feed and Club are the destinations. The bot must be an
+      # administrator in Lab and Feed with "Post messages", and in Club.
+      - key: LAB_CHANNEL
+        value: AvenorLab
+      - key: FEED_CHANNEL
+        value: AvenorFeed
+      - key: CLUB_CHAT
+        value: AvenorClub
+      - key: CHANNEL_NUDGE_EVERY
+        value: "43200"
+      - key: CHANNEL_NUDGE_TTL
+        value: "600"
