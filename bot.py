@@ -111,6 +111,7 @@ from google.genai import types
 
 # The prompt is CORE + packs (see packs.py) instead of one giant string.
 from packs import CORE, build_prompt, pick_packs, prompt_tokens_approx
+import channels as CH
 
 # Optional: load a local .env so `cp .env.example .env` actually works for local dev.
 # Python does NOT read .env by itself - without this, a fresh local setup silently had no
@@ -733,6 +734,7 @@ CAPABILITY_GROUPS = [
     ]),
     ("Groups", [
         "Know the group name, member count, owner and admins",
+        "Know our Club group and Lab/Feed channels - /channels shows the links",
         "Tell who said what - it never mixes two members up",
         "Welcome new members and show the rules (/rules, /setup, /welcome)",
         "Stay quiet when a message is not for it (mention mode, or its own judgement)",
@@ -2082,6 +2084,7 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
     else:
         lines.append("This is a private (1-to-1) chat (no group).")
 
+    lines.append(CH.one_line())
     uq = user_quote(u.effective_message)
     if uq:
         lines.append(f'The user specifically QUOTED this part of a message: "{uq[:600]}" - '
@@ -5355,6 +5358,7 @@ PUBLIC_COMMANDS = [
     ("voice", "Voice replies on / off"),
     ("id", "Your Telegram ID"),
     ("skills", "What I can do, with examples"),
+    ("channels", "Club, Lab and Feed - the links"),
 ]
 OWNER_COMMANDS = [
     ("improve", "Propose a change to my own code (owner)"),
@@ -5930,6 +5934,10 @@ async def _remember_traffic(u: Update, text: str) -> None:
 async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     msg = u.effective_message
     if msg is None:
+        return
+    # A channel is a broadcast, not a conversation. Replying there puts a bot message in
+    # front of every subscriber, so channel posts are handled by on_channel_post() only.
+    if (getattr(u.effective_chat, "type", "") or "") == "channel":
         return
     text = _sanitize_input(msg.text or msg.caption or "")
     media = media_from_message(msg)
@@ -11310,6 +11318,7 @@ async def _post_init(app) -> None:
     except Exception as e:  # noqa: BLE001
         log.debug("could not read the bot username: %s", e)
     app.create_task(_cleanup_loop())
+    app.create_task(_channel_nudge_loop(app.bot))      # no-op unless CHANNEL_NUDGE_ON
     app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
     app.create_task(_reminder_loop())                  # delivers reminders when due
     global _UA_BOT
@@ -13103,6 +13112,217 @@ async def _improve_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await q.edit_message_text(("✅ " if ok else "⚠️ ") + msg[:3500])
 
 
+# ============================ PART 18: TELEGRAM CHANNELS ============================
+# Lab is the source; Feed and Club are the destinations.
+#
+# A bot CANNOT see channel subscribers joining - the Bot API delivers no per-subscriber join
+# event for channels - so a per-join message in a channel is impossible, not unimplemented.
+# What a bot DOES receive is `channel_post`, and that is what makes this pipeline possible.
+#
+# The AI is never pointed at a channel post as a conversation: on_message() returns early
+# for chat.type == "channel" (see the guard there). Only this section touches channels.
+_CH_SEEN: dict = {}            # Lab message_id -> epoch, so one post is never posted twice
+_CH_SEEN_MAX = 200
+
+
+def _channels_target(value) -> str:
+    """A send target Telegram accepts: a numeric id as-is, a username as @username."""
+    raw = str(value or "").strip()
+    if re.fullmatch(r"-?\d+", raw):
+        return raw
+    return "@" + CH.norm_handle(raw)
+
+
+async def _channels_ai(sys_instr: str, prompt: str) -> str:
+    """One model call with OUR instruction, not the chat persona.
+
+    sys_prompt_for() is wrong for this job: it answers a person, in their language, with
+    tags. This rewrites an announcement for a channel. So the call goes straight to the
+    model and skips the persona entirely.
+    """
+    if client is not None:
+        try:
+            contents = [types.Content(role="user", parts=_user_parts(prompt))]
+            ans, err = await _gemini_pass(contents, sys_instr, GEMINI_BUDGET, "standard")
+            if ans:
+                return ans
+            log.warning("channel rewrite: gemini returned nothing (%s)", str(err)[:120])
+        except Exception as e:  # noqa: BLE001
+            log.warning("channel rewrite: gemini failed (%s)", str(e)[:120])
+    if GROQ_API_KEY:
+        try:
+            return await ask_groq(sys_instr, [{"role": "user", "content": prompt}]) or ""
+        except Exception as e:  # noqa: BLE001
+            log.warning("channel rewrite: groq failed (%s)", str(e)[:120])
+    return ""
+
+
+async def _channels_send(bot, target: str, text: str, buttons=None, photo_id: str = ""):
+    """One channel/group post with url buttons. Returns the Message, or None on failure."""
+    rows = [[InlineKeyboardButton(label, url=url)] for label, url in (buttons or []) if url]
+    markup = InlineKeyboardMarkup(rows) if rows else None
+    body = (text or "").strip()
+    if not body:
+        return None
+    await rate_gate(target)
+    if photo_id:
+        try:
+            return await bot.send_photo(chat_id=target, photo=photo_id,
+                                        caption=body[:1024], reply_markup=markup)
+        except Exception as e:  # noqa: BLE001
+            log.warning("channel photo post failed (%s) - falling back to text", str(e)[:120])
+    try:
+        return await bot.send_message(chat_id=target, text=body[:TG_TEXT_LIMIT],
+                                      reply_markup=markup,
+                                      link_preview_options=_NO_PREVIEW)
+    except Exception as e:  # noqa: BLE001
+        log.warning("channel post to %s failed: %s", target, str(e)[:150])
+        return None
+
+
+def _channels_source(post) -> tuple:
+    """(text, primary link, photo file_id, upload facts) from one channel post."""
+    text = (post.text or post.caption or "").strip()
+    extra = []
+    for ent in list(getattr(post, "entities", None) or []) + list(
+            getattr(post, "caption_entities", None) or []):
+        if getattr(ent, "type", "") == "text_link" and getattr(ent, "url", ""):
+            extra.append(ent.url)
+    link = CH.pick_primary_link(CH.extract_links(text, extra))
+    photo_id = ""
+    photo = getattr(post, "photo", None)
+    if photo:
+        photo_id = photo[-1].file_id
+    facts = CH.file_facts(getattr(post, "document", None))
+    return text, link, photo_id, facts
+
+
+async def _channels_link_context(link: str) -> str:
+    """Best-effort read of the link so the rewrite describes the real thing, not a guess."""
+    if not link:
+        return ""
+    try:
+        if not _url_is_public(link):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        return (await asyncio.wait_for(_read_page(link, limit=1200), timeout=12)) or ""
+    except Exception as e:  # noqa: BLE001
+        log.info("channel link read failed (%s): %s", link[:60], str(e)[:80])
+        return ""
+
+
+async def _channels_redistribute(bot, post) -> None:
+    """One Lab upload -> one Feed notice. A Club copy only when CHANNEL_POST_CLUB is on.
+
+    Feed is the noticeboard, so the notice goes there. Club is a conversation and an
+    announcement interrupts it, so it is off by default.
+    """
+    source, link, photo_id, facts = _channels_source(post)
+    if not source and not link and not facts:
+        log.info("channel redistribute: lab msg %s has nothing to send", post.message_id)
+        return
+    context = await _channels_link_context(link)
+    feed_text = club_text = ""
+    try:
+        raw = await _channels_ai(CH.REWRITE_SYS,
+                                 CH.feed_prompt(source, context, link, facts))
+        feed_text, club_text = CH.parse_rewrite(raw)
+    except Exception as e:  # noqa: BLE001
+        log.warning("channel rewrite failed: %s", str(e)[:120])
+    if not feed_text:
+        # No model, no rewrite: post exactly what the owner wrote, plus the one certain
+        # fact about the upload. A plain notice beats a wrong one, and both beat silence.
+        fallback = source or (facts.get("name", "") if facts else "") or "Naya upload"
+        if facts:
+            fallback = (fallback + "\n" + CH.file_line(facts)).strip()
+        feed_text = club_text = fallback
+        log.info("channel redistribute: posting the source text unrewritten")
+
+    # The uploaded file stays in the Lab post - one copy, so it can never go stale. The
+    # Download button is that permalink.
+    buttons = []
+    download = CH.download_button(post.message_id)
+    if download:
+        buttons.append(download)
+    if link:
+        buttons.append((CH.auto_button_label(link), link))
+    if not download and CH.chat_url(CH.LAB):
+        buttons.append(("Lab post", CH.lab_post_url(post.message_id)))
+
+    sent = []
+    if await _channels_send(bot, _channels_target(CH.FEED), feed_text, buttons, photo_id):
+        sent.append("feed")
+    if CH.POST_CLUB and await _channels_send(bot, _channels_target(CH.CLUB), club_text,
+                                             buttons, photo_id):
+        sent.append("club")
+    log.info("channel redistribute: lab=%s -> %s (file=%s link=%s)", post.message_id,
+             ", ".join(sent) or "nothing sent",
+             (facts.get("name") or "-")[:40], (link or "-")[:60])
+
+
+async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """A post in a channel. Only Lab is a source, and our own posts are never fed back."""
+    post = u.channel_post
+    if post is None or not CH.REDISTRIBUTE_ON:
+        return
+    if not CH.is_lab(u.effective_chat):
+        return
+    via = getattr(post, "via_bot", None)
+    if via is not None and getattr(via, "id", None) == getattr(c.bot, "id", None):
+        return                     # our own nudge - never re-post it, or it loops forever
+    if post.message_id in _CH_SEEN:
+        return
+    _CH_SEEN[post.message_id] = time.time()
+    if len(_CH_SEEN) > _CH_SEEN_MAX:
+        for k in sorted(_CH_SEEN, key=lambda k: _CH_SEEN[k])[:-_CH_SEEN_MAX]:
+            _CH_SEEN.pop(k, None)
+    log.info("channel post in Lab (msg %s) -> redistributing", post.message_id)
+    asyncio.create_task(_channels_redistribute(c.bot, post))
+
+
+async def _channel_nudge_once(bot) -> None:
+    """The one small nudge Lab gets, removed again after CHANNEL_NUDGE_TTL seconds."""
+    target = _channels_target(CH.LAB)
+    msg = await _channels_send(bot, target, CH.nudge_text(), CH.nudge_buttons())
+    if msg is None:
+        return
+    log.info("channel nudge posted in Lab (msg %s); deleting in %.0fs",
+             getattr(msg, "message_id", "?"), CH.NUDGE_TTL)
+    # As a task, not an await: _self_delete sleeps for the whole TTL, and awaiting it here
+    # would hold the nudge loop for ten minutes every cycle.
+    asyncio.create_task(_self_delete(bot, target, msg.message_id, CH.NUDGE_TTL))
+
+
+async def _channel_nudge_loop(bot) -> None:
+    """Keep Lab's one line alive without turning the channel into a bot feed."""
+    if not CH.NUDGE_ON:
+        log.info("channel nudge: off (CHANNEL_NUDGE_ON=false)")
+        return
+    await asyncio.sleep(180)               # let startup settle before the first post
+    while True:
+        try:
+            await _channel_nudge_once(bot)
+        except Exception as e:  # noqa: BLE001
+            log.warning("channel nudge failed: %s", str(e)[:150])
+        await asyncio.sleep(CH.NUDGE_EVERY)
+
+
+async def cmd_channels(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """/channels - the three chats, their links, and what happens in each."""
+    rows = ["Our chats"]
+    for role, kind, link, what in CH.details():
+        rows.append("")
+        rows.append(role + " (" + kind + ") - " + what)
+        rows.append(link)
+    rows.append("")
+    rows.append("Lab me sirf source post hota hai. Feed aur Club me usi ka rewritten "
+                "version jaata hai. Join welcome sirf Club me jaata hai, kisi channel me "
+                "nahi - channel me welcome post sabko dikhta hai, isliye woh spam hota hai.")
+    await _send_plain(c.bot, u.effective_chat.id, "\n".join(rows))
+
+
 def _build_app() -> Application:
     global _RATE_LIMITER_ON
     builder = (ApplicationBuilder().token(BOT_TOKEN)
@@ -13155,6 +13375,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("voicecreate", cmd_voicecreate))
     app.add_handler(CommandHandler("voicelist", cmd_voicelist))
     app.add_handler(CommandHandler("voicefind", cmd_voicefind))
+    app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CommandHandler("myphoto", cmd_myphoto))
     app.add_handler(CommandHandler("logo", cmd_logo))
     app.add_handler(CallbackQueryHandler(on_button))
@@ -13162,6 +13383,9 @@ def _build_app() -> Application:
     app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(ChatMemberHandler(on_chat_member,
                                       chat_member_types=ChatMemberHandler.CHAT_MEMBER))
+    # Channel posts go to their own handler. A MessageHandler matches channel posts too,
+    # so without this one Lab posts would also be answered as chat.
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VOICE | filters.AUDIO
          | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL

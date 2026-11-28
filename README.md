@@ -308,14 +308,38 @@ Three chats, three different jobs:
 
 | Chat | Type | What the bot does there |
 |---|---|---|
-| [Avenor Club](https://t.me/AvenorClub) | group | join welcome, answers, polls |
-| [Avenor Lab](https://t.me/AvenorLab) | channel | posts only |
-| [Avenor Feed](https://t.me/AvenorFeed) | channel | posts only |
+| [Avenor Club](https://t.me/AvenorClub) | group | a normal chat room: members talk, the bot talks, join welcome lands here |
+| [Avenor Lab](https://t.me/AvenorLab) | channel | **source**: the owner uploads his own apps and builds |
+| [Avenor Feed](https://t.me/AvenorFeed) | channel | information and updates: one notice per Lab upload |
 
-A **join welcome is sent to the group only**. It never fires in a channel: a channel post is public,
+**Lab is the source, Feed is the noticeboard, Club is the room.** Upload an Android app, a PC app or
+any build to Lab and the bot writes a notice for Feed from what was actually uploaded — the file
+name, its kind (Android app, Windows app, Archive) and its size are read from the document itself,
+so the notice never guesses. The notice carries one **Download** button that opens the original Lab
+post, because the file lives in exactly one place and a second copy would go stale the moment a new
+build is uploaded. If every provider is rate-limited the caption is posted unchanged plus that one
+certain line; a plain notice beats a wrong one.
+
+**Club does not get the announcement by default.** Club is a conversation, and a notice dropped into
+a group interrupts it. Set `CHANNEL_POST_CLUB=true` if you want the copy as well.
+
+**The bot posts almost nothing in Lab.** Once every `CHANNEL_NUDGE_EVERY` (default 12h) it puts one
+two-line nudge with Club and Feed buttons there and deletes it again after `CHANNEL_NUDGE_TTL`
+(default 10 minutes). That is the whole footprint. Set `CHANNEL_NUDGE_ON=false` to remove it too.
+
+**A join welcome is sent to the group only.** It never fires in a channel: a channel post is public,
 so a welcome card there is spam for every other subscriber, and repeated membership changes made it
 repeat. `WELCOME_CHATS` (default `avenorclub`) decides which groups are eligible; a channel is
 excluded before that list is even read.
+
+**Channel posts are never answered as chat.** A Telegram `MessageHandler` matches channel posts as
+well as messages, so `on_message()` returns immediately when `chat.type == "channel"`. Without that
+guard every Lab post would also get an AI reply in front of the whole channel.
+
+`/channels` prints the three links and what happens in each. Requirements on the Telegram side: the
+bot must be an administrator in Lab and Feed with **Post messages**, and in Club. A bot cannot see
+channel subscribers joining — the Bot API delivers no per-subscriber join event for channels — so a
+per-join message in a channel is impossible, which is why Lab gets the nudge instead.
 
 ## Group safety
 
